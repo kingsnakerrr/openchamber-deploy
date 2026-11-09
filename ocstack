@@ -290,184 +290,126 @@ EOF
 # install
 # =============================================================================
 cmd_install() {
-  local DOMAINS=""
-
-  # 解析参数
+  # 解析参数（全部可选，不传就自动决定）
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --yes|-y) ASSUME_YES="true"; shift ;;
+      --yes|-y)     ASSUME_YES="true"; shift ;;
       --oc-domain)  OC_DOMAIN_ARG="${2:-}"; shift 2 ;;
       --api-domain) API_DOMAIN_ARG="${2:-}"; shift 2 ;;
       --email)      EMAIL_ARG="${2:-}"; shift 2 ;;
       --cc-key)     CC_API_KEY="${2:-}"; shift 2 ;;
-      *) die "未知参数：$1" ;;
+      *) die "未知参数：$1（./ocstack help 查看）" ;;
     esac
   done
 
   printf '\n%s%s oc-stack 安装器 v%s %s\n' "$B" "$CYA" "$OCSTACK_VERSION" "$R"
-  printf '%s Sub2API + OpenCode + OpenChamber + Caddy（全 Docker）%s\n\n' "$DIM" "$R"
+  printf '%s 全部密码自动生成，安装完直接给你地址和密码%s\n\n' "$DIM" "$R"
 
   # ---- 1. 环境 ----
-  head1 "1/7 检查环境"
+  head1 "1/5 检查环境"
   if ! command -v docker >/dev/null 2>&1; then
-    info "未安装 Docker，正在安装"
+    info "安装 Docker"
     curl -fsSL https://get.docker.com | sh >/dev/null 2>&1 || die "Docker 安装失败"
     systemctl enable --now docker >/dev/null 2>&1 || true
   fi
   need_docker
-  ok "Docker $(docker --version | cut -d, -f1)"
-  ok "Compose $(docker compose version --short 2>/dev/null || echo ok)"
+  ok "Docker $(docker --version | cut -d, -f1) / Compose $(docker compose version --short 2>/dev/null || echo ok)"
 
-  # 端口占用预检：80/443 被 nginx 之类占了会导致 caddy 起不来
+  # 80/443 被占用时自动避让
   local port_in_use=""
   for p in 80 443; do
-    if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$"; then
-      port_in_use="${port_in_use} ${p}"
-    fi
+    ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$" && port_in_use="${port_in_use} ${p}"
   done
   if [[ -n "$port_in_use" ]]; then
-    warn "端口被占用：${port_in_use}"
-    warn "占用者：$(ss -tlnp 2>/dev/null | grep -E ':(80|443) ' | sed -E 's/.*users:\(\("([^"]+)".*/(\1)/' | sort -u | tr '\n' ' ')"
-    cat <<'EOM'
-  两个选择：
-    A) 停掉占用 80/443 的服务（如 nginx），让 Caddy 接管
-    B) 让 Caddy 用别的端口，前面那层反代指过来
-EOM
     local free_h free_s
-    free_h="$(free_port 8080)" || die "找不到空闲端口"
-    free_s="$(free_port $((free_h + 100)))" || die "找不到空闲端口"
-    if [[ "$ASSUME_YES" == "true" ]]; then
-      warn "--yes 模式：自动改用 ${free_h}/${free_s}，由现有反代转发"
-      CADDY_HTTP_PORT="$free_h"; CADDY_HTTPS_PORT="$free_s"
-    else
-      if ask_yn "  改用 ${free_h}/${free_s}（需你自己在前置反代里转发）？" "y"; then
-        CADDY_HTTP_PORT="$free_h"; CADDY_HTTPS_PORT="$free_s"
-      else
-        die "请先释放 80/443 后重试：sudo systemctl stop nginx"
-      fi
-    fi
+    free_h="$(free_port 8080)"; free_s="$(free_port $((free_h + 100)))"
+    CADDY_HTTP_PORT="$free_h"; CADDY_HTTPS_PORT="$free_s"
+    warn "80/443 已被占用，Caddy 改用 ${free_h}/${free_s}"
+    warn "如需 HTTPS，请在前置反代里把域名转发到这两个端口"
+  else
+    ok "80/443 可用"
   fi
 
   local mem_mb
   mem_mb=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
-  if (( mem_mb < 3500 )); then
-    warn "内存 ${mem_mb}MB。当前栈（PG+Redis+Sub2API+OpenChamber）建议 4GB 以上"
-  else
-    ok "内存 ${mem_mb}MB"
-  fi
+  (( mem_mb < 3500 )) && warn "内存 ${mem_mb}MB，建议 4GB 以上" || ok "内存 ${mem_mb}MB"
 
-  # ---- 2. 域名 ----
-  head1 "2/7 配置域名"
-  cat <<'EOF'
-  需要几个域名？
-
-    OpenChamber 域名   —— 你平时打开网页用的，比如 oc.example.com
-    Sub2API 域名       —— 网关地址，供 OpenCode/其他客户端调用，比如 api.example.com
-
-  两个都填：最推荐，各自独立、证书独立
-  只填第一个：Sub2API 走内部网络，只给本机的 OpenChamber 用
-  两个都空：IP 模式，用 HTTP 访问，无加密（不推荐）
-
-EOF
+  # ---- 2. 域名（唯一需要输入的，可直接回车跳过）----
+  head1 "2/5 域名（可跳过）"
 
   local OC_DOMAIN="${OC_DOMAIN_ARG:-}" API_DOMAIN="${API_DOMAIN_ARG:-}" ACME_EMAIL="${EMAIL_ARG:-}"
+  [[ -f "$ENV_FILE" ]] && {
+    OC_DOMAIN="${OC_DOMAIN:-$(envget OC_DOMAIN)}"
+    API_DOMAIN="${API_DOMAIN:-$(envget API_DOMAIN)}"
+    ACME_EMAIL="${ACME_EMAIL:-$(envget ACME_EMAIL)}"
+  }
 
-  [[ -f "$ENV_FILE" ]] && { OC_DOMAIN="${OC_DOMAIN:-$(envget OC_DOMAIN)}"; API_DOMAIN="${API_DOMAIN:-$(envget API_DOMAIN)}"; ACME_EMAIL="${ACME_EMAIL:-$(envget ACME_EMAIL)}"; }
+  if [[ "$ASSUME_YES" != "true" && -z "$OC_DOMAIN_ARG" ]]; then
+    cat <<'EOF'
+  有域名就填，没有直接回车（用 IP + HTTP 访问，之后可随时重跑本命令加域名）。
 
-  ask OC_DOMAIN    "  OpenChamber 域名（留空跳过）" "$OC_DOMAIN"
-  ask API_DOMAIN   "  Sub2API 域名（留空跳过）"     "$API_DOMAIN"
-
-  local IP_MODE="false"
-  if [[ -z "$OC_DOMAIN" ]]; then
-    IP_MODE="true"
-    warn "未填 OpenChamber 域名 → 进入 IP 模式（HTTP，无加密）"
-  else
-    ask ACME_EMAIL "  证书通知邮箱" "$ACME_EMAIL"
-    [[ "$ACME_EMAIL" == *@* ]] || die "邮箱格式不对：$ACME_EMAIL"
+  不多问别的：上游地址、API Key 这些装完在网页里填。
+EOF
+    ask OC_DOMAIN  "  OpenChamber 域名" "$OC_DOMAIN"
+    if [[ -n "$OC_DOMAIN" ]]; then
+      ask API_DOMAIN "  Sub2API 域名（可回车跳过，之后用 SSH 隧道进后台）" "$API_DOMAIN"
+      ask ACME_EMAIL "  证书通知邮箱" "$ACME_EMAIL"
+      [[ "$ACME_EMAIL" == *@* ]] || die "邮箱格式不对：$ACME_EMAIL"
+    fi
   fi
 
-  if [[ -n "$OC_DOMAIN" || -n "$API_DOMAIN" ]]; then
+  local IP_MODE="false"
+  [[ -z "$OC_DOMAIN" ]] && IP_MODE="true"
+
+  if [[ -n "$OC_DOMAIN" ]]; then
     head1 "  DNS 检查"
     local d ip
     for d in $OC_DOMAIN $API_DOMAIN; do
       [[ -z "$d" ]] && continue
       ip="$(getent hosts "$d" 2>/dev/null | awk '{print $1; exit}' || true)"
       if [[ -z "$ip" ]]; then
-        warn "$d 尚未解析。请先在 DNS 里加 A 记录指向本机公网 IP"
-        warn "证书申请会失败，直到解析生效"
+        warn "$d 未解析，证书申请会失败（先去 DNS 加 A 记录）"
       else
         ok "$d → $ip"
       fi
     done
   fi
 
-  # ---- 3. 账号密码 ----
-  head1 "3/7 生成账号与密钥"
-  local OPENCHAMBER_UI_PASSWORD ADMIN_EMAIL ADMIN_PASSWORD
+  # ---- 3. 生成全部凭据 ----
+  head1 "3/5 生成凭据"
+  local OPENCHAMBER_UI_PASSWORD ADMIN_EMAIL ADMIN_PASSWORD IP_HTTP_PORT IP_API_PORT
   OPENCHAMBER_UI_PASSWORD="$(envget OPENCHAMBER_UI_PASSWORD)"
   [[ -z "$OPENCHAMBER_UI_PASSWORD" ]] && OPENCHAMBER_UI_PASSWORD="$(rand_pw)"
-  ADMIN_EMAIL="$(envget ADMIN_EMAIL)"; [[ -z "$ADMIN_EMAIL" ]] && ADMIN_EMAIL="admin@oc.local"
-  ADMIN_PASSWORD="$(envget ADMIN_PASSWORD)"; [[ -z "$ADMIN_PASSWORD" ]] && ADMIN_PASSWORD="$(rand_pw)"
-
-  # 实测：Sub2API 要求管理员密码 >= 8 位
-  if (( ${#ADMIN_PASSWORD} < 8 )); then
-    warn "管理员密码不足 8 位，重新生成"
-    ADMIN_PASSWORD="$(rand_pw)"
-  fi
+  ADMIN_EMAIL="$(envget ADMIN_EMAIL)"
+  [[ -z "$ADMIN_EMAIL" ]] && ADMIN_EMAIL="admin@oc.local"
+  ADMIN_PASSWORD="$(envget ADMIN_PASSWORD)"
+  [[ -z "$ADMIN_PASSWORD" || ${#ADMIN_PASSWORD} -lt 8 ]] && ADMIN_PASSWORD="$(rand_pw)"
   (( ${#ADMIN_PASSWORD} >= 8 )) || ADMIN_PASSWORD="$(rand_pw)x9"
 
-  # ---- 4. 上游 ----
-  head1 "4/7 上游模型（可选，可稍后用 ./ocstack bootstrap 补）"
-  local UPSTREAM_URL="" UPSTREAM_KEY="" SUB2API_MODEL="deepseek/deepseek-v4.1-flash"
-  cat <<'EOF'
-  如果你的上游是现成的 OpenAI 兼容 API（DeepSeek / 官方中转 / 自建网关），
-  填进来安装时就会自动建好分组、账号和密钥。
+  ok "OpenChamber 密码已生成"
+  ok "Sub2API 管理员密码已生成"
+  ok "数据库与 JWT 密钥已生成"
 
-  没有就两个都回车跳过，装完手动在后台配。
-
-EOF
-  if [[ "$ASSUME_YES" != "true" ]] && ask_yn "  现在就配置上游？" "n"; then
-    ask UPSTREAM_URL "  上游 Base URL（不含 /v1）" ""
-    ask UPSTREAM_KEY "  上游 API Key" ""
-    ask SUB2API_MODEL "  模型 ID" "deepseek/deepseek-v4.1-flash"
-  fi
-
-  # ---- 4.5 Command Code 订阅直连（可选）----
-  head1 "4.5/7 Command Code 订阅（可选）"
-  cat <<'EOF'
-  Command Code 有两个 API 面：
-
-    /provider/v1/...          需要 Provider 付费档（贵）
-    /alpha/generate           普通订阅就能用（私有接口）
-
-  加上 cc-proxy 容器后，普通订阅就能当标准 OpenAI 接口用。
-  有 Command Code 订阅就填 Key（https://commandcode.ai/settings），
-  没有就回车跳过，不影响其他功能。
-
-EOF
-  if [[ -z "$CC_API_KEY" ]] && [[ "$ASSUME_YES" != "true" ]] && ask_yn "  接入 Command Code 订阅？" "n"; then
-    ask CC_API_KEY "  Command Code API Key" ""
-  fi
-
-  # ---- 5. 写 .env ----
-  head1 "5/7 写入配置"
-
-  # IP 模式需要两个额外入口，和 Caddy 的端口错开
-  local IP_HTTP_PORT IP_API_PORT
   if [[ "$IP_MODE" == "true" ]]; then
     IP_HTTP_PORT="$(free_port $((CADDY_HTTP_PORT + 2)))"
     IP_API_PORT="$(free_port $((IP_HTTP_PORT + 1)))"
   else
     IP_HTTP_PORT="8080"
-    IP_API_PORT="8081"
+    IP_API_PORT="$(free_port 8081)"
   fi
+  # Sub2API 始终绑 127.0.0.1，方便 SSH 隧道进后台（不暴露公网）
+  local SUB2API_LOCAL_PORT
+  SUB2API_LOCAL_PORT="$(free_port $((IP_API_PORT + 1)))"
+
+  # ---- 4. 写配置 ----
+  head1 "4/5 写入配置"
   [[ -f "$ENV_FILE" ]] && { cp "$ENV_FILE" "$ENV_FILE.bak.$(date +%s)"; warn "已有 .env，已备份"; }
 
   {
     echo "# oc-stack 配置 — $(date -Iseconds)"
     echo "# 由 ./ocstack install 生成。改完执行 ./ocstack restart"
     echo
-    echo "# ---- 域名 ----"
+    echo "# ---- 域名（留空 = IP 模式）----"
     echo "OC_DOMAIN=${OC_DOMAIN}"
     echo "API_DOMAIN=${API_DOMAIN}"
     echo "ACME_EMAIL=${ACME_EMAIL}"
@@ -477,10 +419,8 @@ EOF
     echo "OPENCODE_VERSION=${OPENCODE_VERSION:-2.2.6}"
     echo "OPENCHAMBER_VERSION=${OPENCHAMBER_VERSION:-2.7.0}"
     echo
-    echo "# ---- OpenChamber ----"
+    echo "# ---- 登录凭据 ----"
     echo "OPENCHAMBER_UI_PASSWORD=${OPENCHAMBER_UI_PASSWORD}"
-    echo
-    echo "# ---- Sub2API 管理员 ----"
     echo "ADMIN_EMAIL=${ADMIN_EMAIL}"
     echo "ADMIN_PASSWORD=${ADMIN_PASSWORD}"
     echo
@@ -494,20 +434,20 @@ EOF
     echo "JWT_SECRET=$(rand_hex)"
     echo "TOTP_ENCRYPTION_KEY=$(rand_hex)"
     echo
-    echo "# ---- 模型 ----"
-    echo "SUB2API_MODEL=${SUB2API_MODEL:-deepseek/deepseek-v4.1-flash}"
+    echo "# ---- 模型（装完在网页里可以改）----"
+    echo "SUB2API_MODEL=deepseek/deepseek-v4.1-flash"
     echo "SUB2API_MODEL_ALIAS=deepseek-v4.1-flash"
     echo "SUB2API_MODEL_NAME=DeepSeek V4.1 Flash"
     echo "SUB2API_API_KEY="
     echo
-    echo "# ---- 反代端口（80/443 被占用时自动改过）----"
+    echo "# ---- 端口 ----"
     echo "CADDY_HTTP_PORT=${CADDY_HTTP_PORT:-80}"
     echo "CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT:-443}"
-    echo "# IP 模式的额外入口端口（和上面错开，避免冲突）"
     echo "HTTP_PORT=${IP_HTTP_PORT}"
     echo "API_HTTP_PORT=${IP_API_PORT}"
+    echo "SUB2API_LOCAL_PORT=${SUB2API_LOCAL_PORT}"
     echo
-    echo "# ---- Command Code 订阅代理（可选，填了才会启 cc 容器的 profile）----"
+    echo "# ---- Command Code 订阅代理（可选，填了才会启 cc 容器）----"
     echo "CC_API_KEY=${CC_API_KEY}"
     echo "CC_PROXY_VERSION=0.4.1"
     echo "CC_IDLE_TIMEOUT_MS=300000"
@@ -519,48 +459,24 @@ EOF
   chmod 600 "$ENV_FILE"
   ok ".env 已写入（600）"
 
-  # 记录上游参数给 bootstrap 用（不写进 .env，避免混入 compose 变量）
-  if [[ -n "$UPSTREAM_URL" ]]; then
-    cat > "$ROOT/.upstream" <<EOF
-UPSTREAM_URL=${UPSTREAM_URL}
-UPSTREAM_KEY=${UPSTREAM_KEY}
-EOF
-    chmod 600 "$ROOT/.upstream"
-    ok "上游参数已记录到 .upstream（600）"
-  fi
-
-  # ---- 6. 生成 Caddyfile ----
-  head1 "6/7 生成反代配置"
+  # ---- 5. 构建启动 ----
+  head1 "5/5 构建并启动"
   write_caddyfile "$OC_DOMAIN" "$API_DOMAIN" "$ACME_EMAIL" "$IP_MODE" "$IP_HTTP_PORT" "$IP_API_PORT"
 
-  # ---- 7. 构建并启动 ----
-  head1 "7/7 构建并启动"
-  info "构建 OpenChamber 镜像（首次约 3-5 分钟）"
-  dc build openchamber 2>&1 | tail -3
+  info "构建 OpenChamber 镜像（首次 3-5 分钟）"
+  dc build openchamber 2>&1 | tail -2
 
-  info "启动全部服务"
+  info "启动服务"
   local PROFILES=()
   [[ -n "$CC_API_KEY" ]] && PROFILES=(--profile cc)
-  dc up -d "${PROFILES[@]}" 2>&1 | tail -5
+  dc up -d "${PROFILES[@]}" 2>&1 | tail -3
 
-  info "等待服务就绪"
+  info "等待就绪"
   local i
-  for i in $(seq 1 60); do
-    if dc ps --format json 2>/dev/null | grep -q '"Health":"healthy"'; then
-      :
-    fi
-    if docker exec oc-sub2api wget -q -T 3 -O /dev/null http://localhost:8080/health 2>/dev/null; then
-      ok "Sub2API 就绪"
-      break
-    fi
+  for i in $(seq 1 80); do
+    docker exec oc-sub2api wget -q -T 3 -O /dev/null http://localhost:8080/health 2>/dev/null && { ok "Sub2API 就绪"; break; }
     sleep 3
   done
-
-  # 自动 bootstrap
-  if [[ -n "$UPSTREAM_URL" && -n "$UPSTREAM_KEY" ]]; then
-    head1 "自动配置 Sub2API"
-    cmd_bootstrap --from-file || warn "自动配置未完全成功，可稍后重跑 ./ocstack bootstrap"
-  fi
 
   print_summary
 }
@@ -803,9 +719,10 @@ print(json.dumps({
 # =============================================================================
 cmd_verify() {
   need_env
-  local PASS=0 FAIL=0
+  local PASS=0 FAIL=0 SKIP=0
   p() { printf '%s  PASS%s %s\n' "$GRN" "$R" "$*"; PASS=$((PASS+1)); }
   f() { printf '%s  FAIL%s %s\n' "$RED" "$R" "$*"; FAIL=$((FAIL+1)); }
+  s_() { printf '%s  待办%s %s\n' "$YEL" "$R" "$*"; SKIP=$((SKIP+1)); }
 
   head1 "1. 容器"
   local bad=0
@@ -833,10 +750,16 @@ cmd_verify() {
   else
     p "OpenChamber 端口未暴露"
   fi
-  if docker port oc-sub2api 2>/dev/null | grep -qE '^8080|:8080'; then
-    f "Sub2API 的 8080 端口暴露到宿主机"
+  # Sub2API 允许绑 127.0.0.1（供 SSH 隧道进后台），
+  # 但绝不能绑 0.0.0.0 / [::]
+  local sub_ports
+  sub_ports="$(docker port oc-sub2api 2>/dev/null || true)"
+  if echo "$sub_ports" | grep -qE '^(0\.0\.0\.0|\[::\])'; then
+    f "Sub2API 端口暴露到公网（$sub_ports）"
+  elif echo "$sub_ports" | grep -q '127.0.0.1'; then
+    p "Sub2API 仅绑 127.0.0.1（SSH 隧道可用）"
   else
-    p "Sub2API 端口未暴露"
+    p "Sub2API 未映射宿主机端口"
   fi
 
   head1 "3. 网关内部可达"
@@ -850,7 +773,7 @@ cmd_verify() {
   local KEY
   KEY="$(envget SUB2API_API_KEY)"
   if [[ -z "$KEY" ]]; then
-    f "SUB2API_API_KEY 未设置（运行 ./ocstack bootstrap）"
+    s_ "尚未配置上游（去 Sub2API 后台建账号和密钥后，把 sk- 填进 .env 的 SUB2API_API_KEY）"
   else
     p "API Key 已配置（${KEY:0:10}...）"
     local RESP
@@ -889,11 +812,11 @@ cmd_verify() {
       f "工具调用失败：$(echo "$OUT" | tail -2 | tr '\n' ' ' | head -c 150)"
     fi
   else
-    f "缺少 API Key，跳过"
+    s_ "缺少 API Key，跳过工具调用测试"
   fi
 
   printf '\n%s────────────────────────────────%s\n' "$DIM" "$R"
-  printf '  通过 %s%d%s   失败 %s%d%s\n\n' "$GRN" "$PASS" "$R" "$RED" "$FAIL" "$R"
+  printf '  通过 %s%d%s   失败 %s%d%s   待办 %s%d%s\n\n' "$GRN" "$PASS" "$R" "$RED" "$FAIL" "$R" "$YEL" "$SKIP" "$R"
   (( FAIL == 0 )) && printf '%s  全部通过%s\n\n' "$GRN" "$R" && return 0
   printf '%s  有 %d 项失败%s\n\n' "$RED" "$FAIL" "$R"
   return 1
@@ -1018,48 +941,70 @@ cmd_uninstall() {
 }
 
 print_summary() {
-  local oc api pw
+  local oc api pw adm adm_pw
   oc="$(envget OC_DOMAIN)"; api="$(envget API_DOMAIN)"
   pw="$(envget OPENCHAMBER_UI_PASSWORD)"
+  adm="$(envget ADMIN_EMAIL)"; adm_pw="$(envget ADMIN_PASSWORD)"
+  local http_port api_port sub_port
+  http_port="$(envget HTTP_PORT)"; http_port="${http_port:-8080}"
+  api_port="$(envget API_HTTP_PORT)"; api_port="${api_port:-8081}"
+  sub_port="$(envget SUB2API_LOCAL_PORT)"; sub_port="${sub_port:-8081}"
+
   local ip
   ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}' || true)"
   ip="${ip:-<服务器IP>}"
 
-  printf '\n%s%s╭────────────────────────────────────────────────────────╮%s\n' "$B" "$GRN" "$R"
-  printf '%s%s│  安装完成                                              │%s\n' "$B" "$GRN" "$R"
-  printf '%s%s╰────────────────────────────────────────────────────────╯%s\n\n' "$B" "$GRN" "$R"
+  printf '\n%s%s╭──────────────────────────────────────────────────────────╮%s\n' "$B" "$GRN" "$R"
+  printf '%s%s│  安装完成                                                │%s\n' "$B" "$GRN" "$R"
+  printf '%s%s╰──────────────────────────────────────────────────────────╯%s\n' "$B" "$GRN" "$R"
 
-  local http_port api_http_port
-  http_port="$(envget HTTP_PORT)"; http_port="${http_port:-8080}"
-  api_http_port="$(envget API_HTTP_PORT)"; api_http_port="${api_http_port:-8081}"
-
+  printf '\n%s【OpenChamber】%s  —— 平时用这个\n' "$B" "$R"
   if [[ -n "$oc" ]]; then
-    printf '  %sOpenChamber%s  https://%s\n' "$B" "$R" "$oc"
+    printf '   地址    %shttps://%s%s\n' "$GRN" "$oc" "$R"
   else
-    printf '  %sOpenChamber%s  http://%s:%s\n' "$B" "$R" "$ip" "$http_port"
+    printf '   地址    %shttp://%s:%s%s\n' "$GRN" "$ip" "$http_port" "$R"
+    printf '   %s注意：IP 模式是 HTTP 明文，配好域名后重跑 ./ocstack install 即可升 HTTPS%s\n' "$DIM" "$R"
   fi
-  printf '  %sUI 密码%s      %s\n' "$B" "$R" "$pw"
+  printf '   密码    %s%s%s\n' "$B" "$pw" "$R"
+
+  printf '\n%s【Sub2API 后台】%s  —— 填上游地址和 Key 的地方\n' "$B" "$R"
   if [[ -n "$api" ]]; then
-    printf '\n  %sSub2API%s      https://%s\n' "$B" "$R" "$api"
-    printf '  %s管理员%s       %s\n' "$B" "$R" "$(envget ADMIN_EMAIL)"
-    printf '  %s密码%s         %s\n' "$B" "$R" "$(envget ADMIN_PASSWORD)"
+    printf '   地址    %shttps://%s%s\n' "$GRN" "$api" "$R"
   else
-    printf '\n  %sSub2API%s      仅内部网络（不对外）\n' "$B" "$R"
-    printf '  %s管理员%s       %s / %s\n' "$B" "$R" "$(envget ADMIN_EMAIL)" "$(envget ADMIN_PASSWORD)"
+    printf '   地址    %shttp://127.0.0.1:%s%s  （需 SSH 隧道）\n' "$GRN" "$sub_port" "$R"
+    printf '   隧道    %sssh -L %s:127.0.0.1:%s root@%s%s\n' "$DIM" "$sub_port" "$sub_port" "$ip" "$R"
+    printf '   %s然后浏览器打开 http://127.0.0.1:%s%s\n' "$DIM" "$sub_port" "$R"
   fi
+  printf '   账号    %s%s%s\n' "$B" "$adm" "$R"
+  printf '   密码    %s%s%s\n' "$B" "$adm_pw" "$R"
 
   cat <<EOF
 
-  ${B}常用命令${R}
-    ./ocstack status          看状态
-    ./ocstack logs caddy      看证书申请过程
-    ./ocstack bootstrap       补配置上游（如果安装时跳过了）
-    ./ocstack verify          六层验证
-    ./ocstack upgrade         升级
-    ./ocstack uninstall       卸载
+${B}${CYA}接下来三步${R}
 
-  ${B}把代码放进去${R}
-    ${DIM}项目放在 ./workspaces/ 下，容器内路径是 /workspace${R}
+  ${B}1.${R} 打开 Sub2API 后台，加一个上游账号
+     分组 → 新建，平台选 OpenAI
+     账号 → 添加，类型 API Key，填商家的 Base URL 和 Key
+     账号 → 点「测试连接」，必须通过
+     API 密钥 → 创建，绑定刚建的分组，复制 sk-...
+
+  ${B}2.${R} 把密钥填进 OpenChamber
+     登录后进 设置 → 提供商 → Sub2API
+     基础 URL 填：${DIM}你的 Sub2API 地址 + /v1${R}
+     API 密钥填：${DIM}上一步复制的 sk-...${R}
+     ${DIM}（注意：不要填商家的 key，要填 Sub2API 签发的）${R}
+
+  ${B}3.${R} 验证
+     ./ocstack verify
+
+${B}凭据都存在${R}  ${DIM}$ROOT/.env${R}   ${DIM}（600，记得备份）${R}
+
+${B}常用命令${R}
+  ./ocstack status        状态与证书
+  ./ocstack logs caddy    证书申请日志
+  ./ocstack verify        16 项自检
+  ./ocstack upgrade       升级
+  ./ocstack uninstall     卸载
 
 EOF
 }
