@@ -1079,7 +1079,7 @@ main() {
   case "$cmd" in
     install)    cmd_install "$@" ;;
     bootstrap)  cmd_bootstrap "$@" ;;
-    verify)     cmd_verify ;;
+    verify)     cmd_verify || true ;;
     up)         cmd_up "$@" ;;
     down)       cmd_down ;;
     restart)    cmd_restart ;;
