@@ -876,7 +876,7 @@ cmd_status() {
   if [[ -n "$oc" ]]; then
     printf '  OpenChamber  %shttps://%s%s\n' "$GRN" "$oc" "$R"
   else
-    printf '  OpenChamber  %shttp://<服务器IP>:8080%s（IP 模式）\n' "$YEL" "$R"
+    printf '  OpenChamber  %shttp://<服务器IP>:%s%s（IP 模式）\n' "$YEL" "$(envget HTTP_PORT)" "$R"
   fi
   if [[ -n "$api" ]]; then
     printf '  Sub2API      %shttps://%s%s\n' "$GRN" "$api" "$R"
@@ -988,10 +988,14 @@ print_summary() {
   printf '%s%s│  安装完成                                              │%s\n' "$B" "$GRN" "$R"
   printf '%s%s╰────────────────────────────────────────────────────────╯%s\n\n' "$B" "$GRN" "$R"
 
+  local http_port api_http_port
+  http_port="$(envget HTTP_PORT)"; http_port="${http_port:-8080}"
+  api_http_port="$(envget API_HTTP_PORT)"; api_http_port="${api_http_port:-8081}"
+
   if [[ -n "$oc" ]]; then
     printf '  %sOpenChamber%s  https://%s\n' "$B" "$R" "$oc"
   else
-    printf '  %sOpenChamber%s  http://%s:8080\n' "$B" "$R" "$ip"
+    printf '  %sOpenChamber%s  http://%s:%s\n' "$B" "$R" "$ip" "$http_port"
   fi
   printf '  %sUI 密码%s      %s\n' "$B" "$R" "$pw"
   if [[ -n "$api" ]]; then
