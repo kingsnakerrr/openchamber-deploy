@@ -195,6 +195,46 @@ services:
       retries: 5
       start_period: 10s
 
+  # ---------------------------------------------------------------------------
+  # Command Code 订阅代理（可选）
+  #
+  # Command Code 的普通订阅只能走私有接口 /alpha/generate，
+  # /provider/v1/chat/completions 需要 Provider 付费档。
+  # 这个代理把前者翻译成标准 OpenAI 接口。
+  #
+  # 只有当 .env 里填了 CC_API_KEY 时才会启动（profile: cc）。
+  # 关键优势：它和 sub2api 在同一个 Docker 网络，
+  # 不需要 404.rw 教程里的 socat 网桥那一套。
+  # ---------------------------------------------------------------------------
+  cc-proxy:
+    image: node:24-alpine
+    container_name: oc-cc-proxy
+    restart: unless-stopped
+    profiles: ["cc"]
+    expose:
+      - "8787"
+    environment:
+      - CC_API_KEY=${CC_API_KEY:-}
+      - HOST=0.0.0.0
+      - PORT=8787
+      - CC_IDLE_TIMEOUT_MS=${CC_IDLE_TIMEOUT_MS:-300000}
+      - CC_UPSTREAM_TIMEOUT_MS=${CC_UPSTREAM_TIMEOUT_MS:-600000}
+      - LOG_LEVEL=${CC_LOG_LEVEL:-info}
+    command:
+      - sh
+      - -c
+      - |
+        npm install -g --no-audit --no-fund commandcode-api-proxy@${CC_PROXY_VERSION:-0.4.1} >/dev/null 2>&1
+        exec commandcode-api-proxy
+    networks:
+      - oc-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
 networks:
   oc-net:
     driver: bridge

@@ -19,6 +19,7 @@ set -Eeuo pipefail
 OCSTACK_VERSION="2.0.0"
 CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
 CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
+CC_API_KEY="${CC_API_KEY:-}"
 
 # 脚本所在目录即项目根目录，允许从任意位置调用
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,7 +77,10 @@ prepare_dirs() {
 
 dc() {
   prepare_dirs
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+  local prof=()
+  # 填了 CC_API_KEY 就启用 cc-proxy 容器
+  [[ -n "$(envget CC_API_KEY)" ]] && prof=(--profile cc)
+  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "${prof[@]}" "$@"
 }
 
 # 从 .env 读值
@@ -295,6 +299,7 @@ cmd_install() {
       --oc-domain)  OC_DOMAIN_ARG="${2:-}"; shift 2 ;;
       --api-domain) API_DOMAIN_ARG="${2:-}"; shift 2 ;;
       --email)      EMAIL_ARG="${2:-}"; shift 2 ;;
+      --cc-key)     CC_API_KEY="${2:-}"; shift 2 ;;
       *) die "未知参数：$1" ;;
     esac
   done
@@ -427,6 +432,23 @@ EOF
     ask SUB2API_MODEL "  模型 ID" "deepseek/deepseek-v4.1-flash"
   fi
 
+  # ---- 4.5 Command Code 订阅直连（可选）----
+  head1 "4.5/7 Command Code 订阅（可选）"
+  cat <<'EOF'
+  Command Code 有两个 API 面：
+
+    /provider/v1/...          需要 Provider 付费档（贵）
+    /alpha/generate           普通订阅就能用（私有接口）
+
+  加上 cc-proxy 容器后，普通订阅就能当标准 OpenAI 接口用。
+  有 Command Code 订阅就填 Key（https://commandcode.ai/settings），
+  没有就回车跳过，不影响其他功能。
+
+EOF
+  if [[ -z "$CC_API_KEY" ]] && [[ "$ASSUME_YES" != "true" ]] && ask_yn "  接入 Command Code 订阅？" "n"; then
+    ask CC_API_KEY "  Command Code API Key" ""
+  fi
+
   # ---- 5. 写 .env ----
   head1 "5/7 写入配置"
 
@@ -485,6 +507,12 @@ EOF
     echo "HTTP_PORT=${IP_HTTP_PORT}"
     echo "API_HTTP_PORT=${IP_API_PORT}"
     echo
+    echo "# ---- Command Code 订阅代理（可选，填了才会启 cc 容器的 profile）----"
+    echo "CC_API_KEY=${CC_API_KEY}"
+    echo "CC_PROXY_VERSION=0.4.1"
+    echo "CC_IDLE_TIMEOUT_MS=300000"
+    echo "CC_UPSTREAM_TIMEOUT_MS=600000"
+    echo
     echo "# ---- 其他 ----"
     echo "TZ=Asia/Shanghai"
   } > "$ENV_FILE"
@@ -511,7 +539,9 @@ EOF
   dc build openchamber 2>&1 | tail -3
 
   info "启动全部服务"
-  dc up -d 2>&1 | tail -5
+  local PROFILES=()
+  [[ -n "$CC_API_KEY" ]] && PROFILES=(--profile cc)
+  dc up -d "${PROFILES[@]}" 2>&1 | tail -5
 
   info "等待服务就绪"
   local i
@@ -544,6 +574,7 @@ cmd_bootstrap() {
   [[ "${1:-}" == "--from-file" ]] && FROM_FILE="true"
 
   local UPSTREAM_URL="" UPSTREAM_KEY="" MODEL GROUP_NAME="oc-stack" KEY_NAME="oc-stack" BALANCE="100"
+  local PLATFORM="openai"
 
   if [[ "$FROM_FILE" == "true" && -f "$ROOT/.upstream" ]]; then
     # shellcheck disable=SC1091
@@ -553,6 +584,16 @@ cmd_bootstrap() {
     [[ -n "$UPSTREAM_URL" ]] && ask UPSTREAM_KEY "上游 API Key" ""
   fi
   MODEL="$(envget SUB2API_MODEL)"; MODEL="${MODEL:-deepseek/deepseek-v4.1-flash}"
+
+  # 有 Command Code Key 就优先用 cc-proxy（普通订阅也能用，比 Provider 档便宜）
+  local CC_KEY
+  CC_KEY="$(envget CC_API_KEY)"
+  if [[ -n "$CC_KEY" ]]; then
+    PLATFORM="command_code"
+    UPSTREAM_URL="http://cc-proxy:8787/v1"
+    UPSTREAM_KEY="proxy-managed"      # 真实 Key 只在 cc-proxy 容器的环境变量里
+    info "使用 Command Code 订阅（经 cc-proxy 容器，无需 socat 网桥）"
+  fi
 
   local EMAIL PASS
   EMAIL="$(envget ADMIN_EMAIL)"
@@ -627,10 +668,10 @@ except Exception:
   if [[ -n "$GID" ]]; then
     ok "分组已存在（id=$GID）"
   else
-    info "创建分组 $GROUP_NAME（平台 openai）"
+    info "创建分组 $GROUP_NAME（平台 $PLATFORM）"
     local GR
     GR="$(curl -sS -m 20 -X POST "$GW/api/v1/admin/groups" "${AUTH[@]}" \
-      -d "{\"name\":\"$GROUP_NAME\",\"description\":\"ocstack 自动创建\",\"platform\":\"openai\",\"rate_multiplier\":1,\"subscription_type\":\"standard\"}")"
+      -d "$(python3 -c "import json,sys;print(json.dumps({'name':sys.argv[1],'description':'ocstack 自动创建','platform':sys.argv[2],'rate_multiplier':1,'subscription_type':'standard'}))" "$GROUP_NAME" "$PLATFORM")")"
     GID="$(_jget "$GR" "d.get('data',{}).get('id')")"
     [[ -n "$GID" ]] || die "创建分组失败：$(echo "$GR" | head -c 250)"
     ok "分组已创建（id=$GID）"
@@ -671,11 +712,11 @@ print(','.join(str(x) for x in sorted(s)))
       BODY="$(python3 -c "
 import json,sys
 print(json.dumps({
-  'name':'upstream-openai','platform':'openai','type':'apikey',
+  'name':'upstream-'+sys.argv[5],'platform':sys.argv[5],'type':'apikey',
   'credentials':{'api_key':sys.argv[1],'base_url':sys.argv[2],
                  'model_mapping':{sys.argv[3]:sys.argv[3]}},
   'extra':{},'group_ids':[int(sys.argv[4])],'concurrency':5,'priority':1
-}))" "$UPSTREAM_KEY" "$UPSTREAM_URL" "$MODEL" "$GID")"
+}))" "$UPSTREAM_KEY" "$UPSTREAM_URL" "$MODEL" "$GID" "$PLATFORM")"
       AR="$(curl -sS -m 30 -X POST "$GW/api/v1/admin/accounts" "${AUTH[@]}" \
         -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)" -d "$BODY")"
       AID="$(_jget "$AR" "d.get('data',{}).get('id')")"

@@ -42,6 +42,28 @@ Sub2API 域名（留空跳过）:     api.example.com
 
 两个域名都在同一个 DNS 服务商加 A 记录指向服务器 IP 即可，Caddy 会分别申请两张证书。
 
+## Command Code 订阅（可选）
+
+Command Code 有两个 API 面：
+
+| 接口 | 协议 | 需要什么套餐 |
+|---|---|---|
+| `/provider/v1/chat/completions` | 标准 OpenAI | **Provider 付费档**（额外加购） |
+| `/alpha/generate` | 私有（Vercel AI SDK 流） | 普通订阅就行 |
+
+本项目内置 `cc-proxy` 容器，把后者翻译成前者，**普通订阅就能当标准 OpenAI 接口用**，sub2api 直接当普通账号接入。
+
+```bash
+# 安装时问，回答 y 并填 Key（https://commandcode.ai/settings）
+./ocstack install
+# 或者装完补
+./ocstack bootstrap
+```
+
+它和 `404.rw` 那篇教程的区别：那篇因为 sub2api 跑在 Docker 里够不到宿主机 `127.0.0.1:8787`，必须用 `socat` 在网桥网关上再开一份。这里 **cc-proxy 和 sub2api 在同一个 Compose 网络**，直接 `http://cc-proxy:8787/v1` 就能通，少一个 systemd 单元、少一个端口、少一个故障点。
+
+只在你填了 `CC_API_KEY` 时这个容器才启动（Compose `profiles: ["cc"]`），不填完全不影响。
+
 ## 命令
 
 ```bash
@@ -149,6 +171,20 @@ npm install -g @opencode/cli@2.2.6 @openchamber/web@2.7.0
 
 版本号在 `.env` 里，升级时改这里或直接 `./ocstack upgrade`。
 
+## 关于 Telegram 机器人
+
+**Sub2API 本身没有内置 Telegram 支持** —— 查了后端源码，没有 bot / token 的任何实现。
+
+你截图里那个 `/usage` `/pick` `/trend` `/alerts` `/raw` 面板是第三方项目，和 Sub2API 是两个独立服务，常见的有：
+
+| 项目 | 作用 |
+|---|---|
+| `boa-z/sub2api-monitor` | 账号异常告警 + 自助面板，支持 TG / Discord / 飞书 |
+| `xjblszyy/sub2api-bot` | Go 写的运维面板，`/water` 看总水位、补号、重置额度 |
+| `chainfix/sub2api-usage-tg-bot` | 给拼车用户查自己 Key 的用量 |
+
+它们都通过 Sub2API 的 Admin API 或直接读 PostgreSQL 工作，需要单独部署。本项目暂未打包 —— 需要的话可以加成一个可选 profile。
+
 ## 安全
 
 安装完请确认：
@@ -175,6 +211,8 @@ npm install -g @opencode/cli@2.2.6 @openchamber/web@2.7.0
 | 余额为 0 时所有请求 402 | bootstrap 自动充 100 |
 | 合规确认不传 language 会按英文校验 | bootstrap 带 `language:zh` |
 | `max_tokens` 上限 200000 | 配置里用 `max_completion_tokens` |
+| 上游 401 会让 sub2api 自动禁用账号 | 修好 Key 后要手动恢复账号状态，`verify` 会报出来 |
+| 长推理容易断流 | `headerTimeout` 300s / `chunkTimeout` 900s，cc-proxy 另有 `CC_UPSTREAM_TIMEOUT_MS` |
 
 ## 许可
 
