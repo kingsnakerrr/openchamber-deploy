@@ -8,11 +8,31 @@
                      └──> sub2api:8080 ──> 上游模型 API
 ```
 
-## 三分钟上手
+## 一行命令安装
 
 ```bash
-git clone https://github.com/<你的账号>/oc-stack.git
-cd oc-stack
+bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/openchamber-deploy/main/install.sh)
+```
+
+它会自己做完这些事，**已装的全部跳过，缺的才装**：
+
+| 检查项 | 缺失时 |
+|---|---|
+| Debian 12/13 / Ubuntu 22.04+ | 报错退出并说明原因 |
+| `curl` `git` `jq` `openssl` `tar` `gzip` | apt 安装 |
+| `ca-certificates` | apt 安装 |
+| Docker | 官方 `get.docker.com` 脚本 |
+| Docker 守护进程 | `systemctl enable --now docker` |
+| `docker compose` 插件 | apt 安装 |
+| 项目文件 | 下载到 `/opt/oc-stack`，已存在则更新（保留 `.env` 和 `data/`） |
+
+然后自动进入交互式安装。可重复运行，每一步都是幂等的。
+
+### 也可以手动装
+
+```bash
+git clone https://github.com/kingsnakerrr/openchamber-deploy.git
+cd openchamber-deploy
 ./ocstack install
 ```
 
@@ -41,6 +61,43 @@ Sub2API 域名（留空跳过）:     api.example.com
 | 不用域名 | 空 | 空 | IP + HTTP 明文，只适合临时试用 |
 
 两个域名都在同一个 DNS 服务商加 A 记录指向服务器 IP 即可，Caddy 会分别申请两张证书。
+
+## 地址和密钥怎么填（最容易搞混的一步）
+
+整条链路是三层，**每层填的东西不一样**：
+
+```
+OpenChamber  ──key A──>  Sub2API  ──key B──>  上游商家
+   (界面)                  (网关)              (DeepSeek / Command Code / ...)
+```
+
+### 安装时问的两个
+
+| 提示 | 填什么 | 例子 |
+|---|---|---|
+| 上游 Base URL | **商家**的地址（数据源头） | `https://api.deepseek.com` |
+| 上游 API Key | **商家**发给你的 key | `sk-商家key` |
+
+### OpenChamber 设置里填的两个
+
+| 字段 | 填什么 | 例子 |
+|---|---|---|
+| 基础 URL | **你自己的 Sub2API** 地址 | `http://127.0.0.1:8080/v1` 或 `https://api.你的域名/v1` |
+| API 密钥 | **Sub2API 签发**的 key | `sk-30db821c4cfb...` |
+
+**绝对不能把商家的 key 填进 OpenChamber。** 商家 key 是计费凭证，只该存在 Sub2API 的账号配置里；客户端拿到的永远是 Sub2API 二次签发的 key。
+
+如果安装时填了上游信息，`./ocstack bootstrap` 会自动建好 Sub2API 的 key 并写进容器的环境变量，**你不需要在 OpenChamber 里手动加提供商**——容器启动时就生成了 `opencode.json`。设置页里看到 `Sub2API` 已连接就是对的。
+
+### 怎么拿到那个 key
+
+```bash
+# 安装时自动配好的话，直接看
+grep SUB2API_API_KEY /opt/oc-stack/.env
+
+# 或者去后台手动创建
+# https://api.你的域名 → API 密钥 → 创建 → 绑定 OpenAI 分组 → 复制 sk-...
+```
 
 ## Command Code 订阅（可选）
 
