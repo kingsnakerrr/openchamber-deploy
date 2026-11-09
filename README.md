@@ -1,11 +1,11 @@
 # oc-stack
 
-一条命令部署 **Sub2API + OpenCode + OpenChamber**，全 Docker，自动 HTTPS。
+一条命令部署 **OpenChamber + OpenCode**，可选自带 Sub2API 网关，全 Docker，自动 HTTPS。
 
 ```
 公网 443 ──> caddy ──┬──> openchamber:3000 ──> opencode
                      │
-                     └──> sub2api:8080 ──> 上游模型 API
+                     └──> （可选）sub2api ──> 上游模型 API
 ```
 
 ## 安装
@@ -14,35 +14,55 @@
 bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/openchamber-deploy/main/install.sh)
 ```
 
-只问一件事：**域名**。不想现在填就回车跳过，用 IP 访问。
+只问两件事，都能直接回车：
 
-装完直接打印地址和密码，全部自动生成：
+1. **网关**：本地部署 Sub2API，还是连你现成的
+2. **域名**：没有就用 IP + HTTP
+
+密码全部自动生成，装完直接打印。
+
+### 端口
+
+默认全在高位段，避开 qbittorrent / nginx 这些常用端口：
+
+| 用途 | 默认端口 |
+|---|---|
+| Caddy HTTP / HTTPS | 80 / 443（被占用时自动换 18100 / 18200） |
+| OpenChamber | 18102 |
+| Sub2API 网关入口 | 18103 |
+| Sub2API 后台（仅本机） | 18104 |
+
+全部自动探测空闲端口，冲突了就往下挪。
+
+## 两种网关模式
+
+### 本地部署（默认）
+
+新装一套 Sub2API + PostgreSQL + Redis，五个容器。适合从零开始。
+
+### 外接已有
+
+你已经有 Sub2API 在别处跑着，这台只需要 OpenChamber。只起两个容器，配置直接指向你的网关地址。
+
+安装时会读本机 `~/.config/opencode/opencode.json`，把里面出现最多的 `baseURL` 作为默认值填进去，可以直接回车：
 
 ```
-【OpenChamber】  —— 平时用这个
-   地址    http://1.2.3.4:8080
-   密码    7pHIQk7plwwiixmQ2HSg
-
-【Sub2API 后台】  —— 填上游地址和 Key 的地方
-   地址    http://127.0.0.1:8081  （需 SSH 隧道）
-   隧道    ssh -L 8081:127.0.0.1:8081 root@1.2.3.4
-   账号    admin@oc.local
-   密码    36GRFEDXDuScLSNskidz
+  检测到你本机 OpenCode 已配置网关：你的网关地址
+  如果是同一个，选 2 直接复用
 ```
-
-依赖自动检查，已装的跳过、缺的才装：`curl` `git` `jq` `openssl` `tar` `gzip` `ca-certificates` `Docker` `compose`。
-
-支持 Debian 12/13、Ubuntu 22.04+、x86_64 / arm64。
 
 ## 装完三步
 
-**1. 进 Sub2API 后台，加上游账号**
+**1. 网关里加上游账号**（外接模式跳过这步）
 
 分组 → 新建，平台选 OpenAI → 账号 → 添加，类型 API Key，填商家的 Base URL 和 Key → 点「测试连接」→ API 密钥 → 创建，复制 `sk-...`
 
 **2. 把密钥填进 OpenChamber**
 
-设置 → 提供商 → Sub2API，基础 URL 填 `你的 Sub2API 地址 + /v1`，API 密钥填上一步的 `sk-...`
+设置 → 提供商 → Sub2API
+
+- 基础 URL：`你的网关地址 + /v1`
+- API 密钥：上一步的 `sk-...`
 
 **3. 验证**
 
@@ -52,71 +72,75 @@ bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/openchamber-deplo
 
 ## 地址别填错
 
-三层关系，每层填的不一样：
+这是最容易混的一步：
 
 | 位置 | 填什么 | 例子 |
 |---|---|---|
-| Sub2API 后台的「上游账号」 | **商家**的地址和 Key | `https://api.deepseek.com` |
-| OpenChamber 的「基础 URL」 | **你自己**的 Sub2API | `https://api.你的域名/v1` |
-| OpenChamber 的「API 密钥」 | Sub2API **签发**的 Key | `sk-30db821c4c...` |
+| 网关后台的「上游账号」 | **商家**地址和 Key | `https://api.deepseek.com` |
+| OpenChamber 的「基础 URL」 | **网关**地址 | `你的网关地址/v1` |
+| OpenChamber 的「API 密钥」 | 网关**签发**的 Key | `sk-30db821c4c...` |
 
-**不要**把商家的 Key 填进 OpenChamber。商家 Key 只存在 Sub2API 里，客户端永远用二次签发的。
+**不要**把商家的 Key 填进 OpenChamber。商家 Key 只存在网关里，客户端永远用网关二次签发的。
 
 ## 域名
 
-两个域名最好，各自独立证书：
-
 | OpenChamber | Sub2API | 结果 |
 |---|---|---|
-| `oc.example.com` | `api.example.com` | 都走 HTTPS，网关可以给其他客户端用 |
-| `oc.example.com` | 空 | 网关只走内部网络，后台用 SSH 隧道进 |
+| `oc.example.com` | `api.example.com` | 都走 HTTPS |
+| `oc.example.com` | 空 | 后台走 SSH 隧道 |
 | 空 | 空 | IP + HTTP，仅适合试用 |
 
-DNS 加 A 记录指向服务器 IP。装完想加域名，重跑 `./ocstack install` 即可，数据不动。
+DNS 加 A 记录指向服务器 IP。装完想加域名，重跑 `./ocstack install`，数据不动。
+
+没有域名时进网关后台：
+
+```bash
+ssh -L 18104:127.0.0.1:18104 root@服务器
+# 然后浏览器打开 http://127.0.0.1:18104
+```
 
 ## 命令
 
 ```bash
 ./ocstack status        状态、地址、证书
-./ocstack verify        16 项自检
+./ocstack verify        自检
 ./ocstack upgrade       升级
 ./ocstack uninstall     卸载（数据保留）
 ./ocstack uninstall --purge   连数据删
-./ocstack bootstrap     补配置上游
+./ocstack bootstrap     补配置网关
 ./ocstack logs caddy    证书日志
 ```
 
 ## 常见情况
 
-**80/443 被 nginx 占用** → 自动改用空闲端口并提示，前置反代转发过去即可。
+**80/443 被占用** → 自动改用空闲高位端口，前置反代转发过去即可。
 
-**没有域名也要进后台** → 用输出的 SSH 隧道命令，Sub2API 只绑 `127.0.0.1`，不暴露公网。
+**HTTPS 证书** → Caddy 内置 ACME，同时向 Let's Encrypt 和 ZeroSSL 申请，一个失败自动换另一个，到期前 30 天自动续期。不需要 certbot，不需要 cron。
 
-**HTTPS 证书** → Caddy 内置 ACME，同时向 Let's Encrypt 和 ZeroSSL 申请，一个失败自动换另一个，到期前 30 天自动续期，不需要 certbot 也不需要 cron。
+**依赖缺失** → 安装脚本逐项检查 `curl` `git` `jq` `openssl` `tar` `gzip` `ca-certificates` `Docker` `compose`，已装的跳过，缺的才装。支持 Debian 12/13、Ubuntu 22.04+、x86_64 / arm64。
 
 ## 数据
 
 ```
 ./data/openchamber/     OpenChamber 设置
 ./data/opencode/        OpenCode 配置和会话
-./data/sub2api/         Sub2API 应用数据
-./data/postgres/        数据库
-./data/redis/
+./data/sub2api/         网关数据（本地模式）
+./data/postgres/        数据库（本地模式）
 ./workspaces/           你的代码（容器内 /workspace）
 .env                    所有密码和密钥（600）
 ```
 
-备份打包 `.env` + `data/` + `workspaces/` 就行。
+备份打包 `.env` + `data/` + `workspaces/`。
 
 ## Command Code 订阅（可选）
 
-Command Code 普通订阅只能走私有接口 `/alpha/generate`，标准 OpenAI 接口要 Provider 付费档。本项目内置 `cc-proxy` 容器做协议翻译：
+普通订阅只能走私有接口 `/alpha/generate`，标准 OpenAI 接口要付费档。内置 `cc-proxy` 容器做协议翻译：
 
 ```bash
-./ocstack install --cc-key sk-你的CommandCode订阅key
+bash <(curl -Ls .../install.sh) --cc-key sk-你的订阅key
 ```
 
-`cc-proxy` 和 sub2api 在同一个 Docker 网络，不需要额外网桥。只有填了 `CC_API_KEY` 才启动。
+只有填了 key 才启动。
 
 ## 已知限制
 
@@ -129,9 +153,9 @@ Command Code 普通订阅只能走私有接口 `/alpha/generate`，标准 OpenAI
 
 ## 安全
 
-- `.env` 权限 600，只有 caddy 暴露 80/443
+- `.env` 权限 600，只有 caddy 暴露公网端口
 - OpenChamber 必须设密码：它背后能执行任意 shell 命令
-- 防火墙只放 22/80/443
+- 防火墙只放 22 和 Caddy 的端口
 
 `./ocstack verify` 会检查前两项。
 

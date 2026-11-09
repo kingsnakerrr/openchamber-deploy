@@ -28,8 +28,8 @@ services:
       # IP 模式的两个明文入口直接在这里映射（端口来自 .env，安装时探测空闲值）。
       # 有域名时这两个端口不会被 Caddy 监听（Caddyfile 里没有对应站点），
       # 所以不会额外暴露服务。
-      - "${HTTP_PORT:-8080}:${HTTP_PORT:-8080}"
-      - "${API_HTTP_PORT:-8081}:${API_HTTP_PORT:-8081}"
+      - "${HTTP_PORT:-18080}:${HTTP_PORT:-18080}"
+      - "${API_HTTP_PORT:-18081}:${API_HTTP_PORT:-18081}"
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -73,7 +73,7 @@ services:
     environment:
       OPENCHAMBER_UI_PASSWORD: ${OPENCHAMBER_UI_PASSWORD:?请在 .env 里设置 OPENCHAMBER_UI_PASSWORD}
       SUB2API_API_KEY: ${SUB2API_API_KEY:-}
-      SUB2API_BASE_URL: http://sub2api:8080/v1
+      SUB2API_BASE_URL: ${SUB2API_BASE_URL:-http://sub2api:8080/v1}
       SUB2API_MODEL: ${SUB2API_MODEL:-deepseek/deepseek-v4.1-flash}
       SUB2API_MODEL_ALIAS: ${SUB2API_MODEL_ALIAS:-deepseek-v4.1-flash}
       SUB2API_MODEL_NAME: ${SUB2API_MODEL_NAME:-DeepSeek V4.1 Flash}
@@ -81,6 +81,8 @@ services:
     depends_on:
       sub2api:
         condition: service_healthy
+        # 外接已有网关时 sub2api 不启动，这里必须允许缺失
+        required: false
     networks:
       - oc-net
     # 注意：不要加 no-new-privileges，否则容器内的 sudo 无法修正挂载目录权限
@@ -92,12 +94,14 @@ services:
     image: weishaw/sub2api:latest
     container_name: oc-sub2api
     restart: unless-stopped
+    # 只有部署本地网关时才启动；外接已有 Sub2API 时跳过
+    profiles: ["local-gw"]
     ports:
       # 只绑本机，供 SSH 隧道进后台填上游。
       # 想从外面直接访问就设 SSH 隧道：
-      #   ssh -L 8081:127.0.0.1:8081 root@服务器
-      # 然后浏览器打开 http://127.0.0.1:8081
-      - "127.0.0.1:${SUB2API_LOCAL_PORT:-8081}:8080"
+      #   ssh -L 18082:127.0.0.1:18082 root@服务器
+      # 然后浏览器打开 http://127.0.0.1:18082
+      - "127.0.0.1:${SUB2API_LOCAL_PORT:-18082}:8080"
     expose:
       - "8080"
     volumes:
@@ -152,6 +156,7 @@ services:
     image: postgres:18-alpine
     container_name: oc-postgres
     restart: unless-stopped
+    profiles: ["local-gw"]
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     environment:
@@ -176,6 +181,7 @@ services:
     image: redis:8-alpine
     container_name: oc-redis
     restart: unless-stopped
+    profiles: ["local-gw"]
     volumes:
       - ./data/redis:/data
     command:
