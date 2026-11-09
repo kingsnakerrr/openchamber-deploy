@@ -16,7 +16,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/openchamber-deplo
 
 只问两件事，都能直接回车：
 
-1. **网关**：本地部署 Sub2API，还是连你现成的
+1. **网关**：要不要在本机装一套 Sub2API（默认装）
 2. **域名**：没有就用 IP + HTTP
 
 密码全部自动生成，装完直接打印。
@@ -36,20 +36,24 @@ bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/openchamber-deplo
 
 ## 两种网关模式
 
-### 本地部署（默认）
+### 本地部署（默认，推荐）
 
-新装一套 Sub2API + PostgreSQL + Redis，五个容器。适合从零开始。
+```
+  要不要在这台机器上装一套 Sub2API 网关？
+
+    [1] 装（推荐）  自带 PostgreSQL + Redis，装完就是完整独立的一套
+    [2] 不装        你已经有一个能用的，暂时先连过去
+```
+
+选 1 直接回车就是。五个容器，自己的一套，上游账号、密钥、额度、日志全在你手上。
 
 ### 外接已有
 
-你已经有 Sub2API 在别处跑着，这台只需要 OpenChamber。只起两个容器，配置直接指向你的网关地址。
+只有当你在别处**已经有一台自己搭好、能用的** Sub2API 时，才选 2。
 
-安装时会读本机 `~/.config/opencode/opencode.json`，把里面出现最多的 `baseURL` 作为默认值填进去，可以直接回车：
+这时只起 caddy + openchamber 两个容器，安装过程会让你填那个网关的 Base URL。
 
-```
-  检测到你本机 OpenCode 已配置网关：你的网关地址
-  如果是同一个，选 2 直接复用
-```
+选错了也不要紧：重跑 `./ocstack install` 选 1 即可切换到本地部署，数据不会丢。
 
 ## 装完三步
 

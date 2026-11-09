@@ -376,15 +376,18 @@ PY
 
   if [[ "$ASSUME_YES" != "true" ]]; then
     cat <<'EOF'
-  这台机器上要跑 Sub2API 网关吗？
+  要不要在这台机器上装一套 Sub2API 网关？
 
-    1) 是，本地部署   —— 新装一套，自带数据库，适合从零开始   【默认】
-    2) 否，连现成的   —— 你已经有 Sub2API 在别处跑着了
+    [1] 装（推荐）  自带 PostgreSQL + Redis，装完就是完整独立的一套
+    [2] 不装        你已经有一个能用的，暂时先连过去
 
 EOF
     if [[ "$DETECTED_GW" != "http://sub2api:8080/v1" ]]; then
-      printf '%s  检测到你本机 OpenCode 已配置网关：%s%s\n' "$DIM" "$DETECTED_GW" "$R"
-      printf '%s  如果是同一个，选 2 直接复用%s\n\n' "$DIM" "$R"
+      cat <<EOF
+${DIM}  提示：本机 OpenCode 当前指向 $DETECTED_GW
+        那是别人/旧环境的网关。选 [1] 装一套自己的，装完再切过去。
+${R}
+EOF
     fi
     local gw_choice
     ask gw_choice "  选择" "1"
