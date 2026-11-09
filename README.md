@@ -81,7 +81,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/openchamber-deplo
 | 位置 | 填什么 | 例子 |
 |---|---|---|
 | 网关后台的「上游账号」 | **商家**地址和 Key | `https://api.deepseek.com` |
-| OpenChamber 的「基础 URL」 | **网关**地址 | `你的网关地址/v1` |
+| OpenChamber 的「基础 URL」 | **网关**地址 | `https://api.example.com/v1` |
 | OpenChamber 的「API 密钥」 | 网关**签发**的 Key | `sk-30db821c4c...` |
 
 **不要**把商家的 Key 填进 OpenChamber。商家 Key 只存在网关里，客户端永远用网关二次签发的。
