@@ -382,13 +382,6 @@ PY
     [2] 不装        你已经有一个能用的，暂时先连过去
 
 EOF
-    if [[ "$DETECTED_GW" != "http://sub2api:8080/v1" ]]; then
-      cat <<EOF
-${DIM}  提示：本机 OpenCode 当前指向 $DETECTED_GW
-        那是别人/旧环境的网关。选 [1] 装一套自己的，装完再切过去。
-${R}
-EOF
-    fi
     local gw_choice
     ask gw_choice "  选择" "1"
     case "$gw_choice" in
@@ -405,7 +398,7 @@ EOF
 EOF
     ask SUB2API_BASE_URL "  网关 Base URL（含 /v1）" "${SUB2API_BASE_URL:-$DETECTED_GW}"
     [[ "$SUB2API_BASE_URL" == http* ]] || die "地址要以 http:// 或 https:// 开头"
-    ok "外接网关：$SUB2API_BASE_URL"
+    ok "外接网关已设置"
   else
     SUB2API_BASE_URL="http://sub2api:8080/v1"
     ok "本地部署网关（容器内地址 $SUB2API_BASE_URL）"
@@ -867,11 +860,11 @@ cmd_verify() {
 
   if [[ "$GW_MODE" == "external" ]]; then
     if curl -fsS -m 10 -o /dev/null "${GW_URL%/v1}/health" 2>/dev/null; then
-      p "外接网关健康：$GW_URL"
+      p "外接网关健康"
     elif curl -fsS -m 10 -o /dev/null "${GW_URL%/v1}/v1/models" 2>/dev/null; then
-      p "外接网关可达：$GW_URL"
+      p "外接网关可达"
     else
-      f "外接网关不可达：$GW_URL"
+      f "外接网关不可达（检查 .env 的 SUB2API_BASE_URL）"
     fi
   else
     if docker exec oc-sub2api wget -q -T 5 -O /dev/null http://localhost:8080/health 2>/dev/null; then
@@ -1087,9 +1080,8 @@ print_summary() {
   printf '   密码    %s%s%s\n' "$B" "$pw" "$R"
 
   if [[ "$gwmode" == "external" ]]; then
-    printf '\n%s【网关】%s  外接已有 Sub2API，未在本机部署\n' "$B" "$R"
-    printf '   地址    %s%s%s\n' "$GRN" "$gwurl" "$R"
-    printf '   %s密钥请在原网关后台创建后，填进 OpenChamber 设置 → 提供商%s\n' "$DIM" "$R"
+    printf '\n%s【网关】%s  外接已有 Sub2API（地址见 .env 的 SUB2API_BASE_URL）\n' "$B" "$R"
+    printf '   密钥请在原网关后台创建后，填进 OpenChamber 设置 → 提供商\n' "$DIM" "$R"
   else
     printf '\n%s【Sub2API 后台】%s  —— 填上游地址和 Key 的地方\n' "$B" "$R"
     if [[ -n "$api" ]]; then
