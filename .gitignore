@@ -1,32 +1,24 @@
-# ---- 忽略敏感文件 ----
+# 敏感
 .env
 .env.*
 !.env.example
+.upstream
 *.pem
 *.key
-*.p12
-id_rsa*
-auth.json
-*password*
-*secret*
 
-# ---- 运行时数据 ----
+# 运行时数据
 data/
-postgres_data/
-redis_data/
-*.log
-logs/
+workspaces/
+caddy/Caddyfile
+caddy/Caddyfile.bak.*
 
-# ---- 系统 ----
+# 系统 / 编辑器
 .DS_Store
 Thumbs.db
-
-# ---- 编辑器 ----
 .vscode/
 .idea/
 *.swp
 *~
-
-# ---- 备份 ----
 *.bak
 *.bak.*
+*.log

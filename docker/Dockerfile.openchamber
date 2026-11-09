@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# OpenChamber + OpenCode 运行镜像
+#
+# 不从源码构建：直接装官方 npm 包，快且可复现。
+# 版本通过构建参数固定，升级时改 .env 里的两个版本号即可。
+# =============================================================================
+FROM node:24-bookworm-slim
+
+ARG OPENCODE_VERSION=2.2.6
+ARG OPENCHAMBER_VERSION=2.7.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    NODE_ENV=production
+
+# agent 干活需要的运行时：git、python、ripgrep 是高频依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash ca-certificates curl git less openssh-client \
+      python3 python3-pip python3-venv \
+      ripgrep jq unzip xz-utils procps sudo \
+      build-essential \
+      libatomic1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --no-audit --no-fund \
+      "@opencode/cli@${OPENCODE_VERSION}" \
+      "@openchamber/web@${OPENCHAMBER_VERSION}" \
+    && npm cache clean --force
+
+# 非 root 运行，UID 固定 1000 方便挂载目录权限
+RUN userdel -r node 2>/dev/null || true \
+    && groupadd -g 1000 openchamber \
+    && useradd -u 1000 -g 1000 -m -s /bin/bash openchamber \
+    && mkdir -p /home/openchamber/.local/share/opencode \
+                /home/openchamber/.local/state/opencode \
+                /home/openchamber/.config/opencode \
+                /home/openchamber/.config/openchamber \
+                /home/openchamber/.ssh \
+                /workspace \
+    && chown -R openchamber:openchamber /home/openchamber /workspace
+
+# 允许容器内的非 root 用户修正挂载点所有权（compose 挂载的目录通常属于 root）
+RUN echo 'openchamber ALL=(root) NOPASSWD: /bin/chown, /usr/bin/chown' \
+      > /etc/sudoers.d/openchamber-chown \
+    && chmod 0440 /etc/sudoers.d/openchamber-chown \
+    && visudo -c >/dev/null
+
+USER openchamber
+WORKDIR /home/openchamber
+
+COPY --chown=openchamber:openchamber docker/entrypoint.sh /usr/local/bin/oc-entrypoint.sh
+RUN chmod +x /usr/local/bin/oc-entrypoint.sh
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:3000/ >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/oc-entrypoint.sh"]

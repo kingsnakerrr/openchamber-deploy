@@ -1,0 +1,1051 @@
+#!/usr/bin/env bash
+# =============================================================================
+# ocstack —— 全 Docker 一键部署 Sub2API + OpenCode + OpenChamber + Caddy
+#
+#   ./ocstack install      首次安装（交互式，会问域名）
+#   ./ocstack up           启动
+#   ./ocstack down         停止
+#   ./ocstack restart      重启
+#   ./ocstack status       状态
+#   ./ocstack logs [服务]  日志
+#   ./ocstack upgrade      拉新镜像并重建
+#   ./ocstack bootstrap    自动配置 Sub2API（分组/账号/密钥）
+#   ./ocstack verify       六层验证
+#   ./ocstack uninstall    卸载
+#   ./ocstack cert         查看证书与续期状态
+# =============================================================================
+set -Eeuo pipefail
+
+OCSTACK_VERSION="2.0.0"
+CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
+CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
+
+# 脚本所在目录即项目根目录，允许从任意位置调用
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+ENV_FILE="$ROOT/.env"
+COMPOSE_FILE="$ROOT/docker-compose.yml"
+CADDY_DIR="$ROOT/caddy"
+CADDY_FILE="$CADDY_DIR/Caddyfile"
+
+# ---- 颜色 -------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  R=$'\033[0m'; DIM=$'\033[2m'; B=$'\033[1m'
+  RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYA=$'\033[36m'
+else
+  R=""; DIM=""; B=""; RED=""; GRN=""; YEL=""; CYA=""
+fi
+info() { printf '%s==>%s %s\n' "$CYA" "$R" "$*"; }
+ok()   { printf '%s  ok%s %s\n' "$GRN" "$R" "$*"; }
+warn() { printf '%s  !!%s %s\n' "$YEL" "$R" "$*" >&2; }
+die()  { printf '%s ERR%s %s\n' "$RED" "$R" "$*" >&2; exit 1; }
+head1(){ printf '\n%s%s▸ %s%s\n' "$B" "$CYA" "$*" "$R"; }
+
+trap 'die "第 ${LINENO} 行失败：${BASH_COMMAND}"' ERR
+
+# ---- 基础检查 ---------------------------------------------------------------
+need_docker() {
+  command -v docker >/dev/null 2>&1 || die "未找到 docker。先跑：./ocstack install（会自动装）"
+  docker info >/dev/null 2>&1 || die "Docker 守护进程未运行：sudo systemctl start docker"
+  docker compose version >/dev/null 2>&1 || die "缺少 docker compose 插件"
+}
+
+need_env() {
+  [[ -f "$ENV_FILE" ]] || die "未找到 .env，先运行：./ocstack install"
+  need_docker
+}
+
+# 预创建数据目录并修正所有权。
+# compose 用 bind mount，宿主上由 root 创建的目录容器内 UID 1000 写不了，
+# 在宿主机上用 root 提前 chown 是最干净的解法（不依赖容器内 sudo）。
+prepare_dirs() {
+  local d
+  mkdir -p "$ROOT"/data/{openchamber,opencode/share,opencode/state,opencode/config} \
+           "$ROOT"/data/{sub2api,postgres,redis} \
+           "$ROOT"/workspaces "$ROOT"/caddy 2>/dev/null || true
+  for d in "$ROOT"/data/openchamber \
+           "$ROOT"/data/opencode/share \
+           "$ROOT"/data/opencode/state \
+           "$ROOT"/data/opencode/config \
+           "$ROOT"/workspaces; do
+    chown -R 1000:1000 "$d" 2>/dev/null || \
+      warn "无法 chown $d（非 root 运行？容器内会尝试自行修正）"
+  done
+}
+
+dc() {
+  prepare_dirs
+  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+}
+
+# 从 .env 读值
+envget() {
+  local v
+  # 文件不存在或键不存在时都必须返回空字符串且退出码 0，
+  # 否则 set -e 会在这里直接终止脚本
+  v="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
+  printf '%s' "$v"
+}
+
+# 写/改 .env 的键（值里有 / 也不会坏）
+setenv() {
+  local k="$1" v="$2"
+  if grep -qE "^${k}=" "$ENV_FILE" 2>/dev/null; then
+    python3 - "$ENV_FILE" "$k" "$v" <<'PY'
+import sys
+path,k,v=sys.argv[1],sys.argv[2],sys.argv[3]
+lines=open(path).read().splitlines()
+out=[f"{k}={v}" if l.startswith(k+"=") else l for l in lines]
+open(path,"w").write("\n".join(out)+"\n")
+PY
+  else
+    printf '%s=%s\n' "$k" "$v" >> "$ENV_FILE"
+  fi
+}
+
+# 找一个当前未被占用的 TCP 端口
+free_port() {
+  local start="${1:-8080}" p
+  for ((p=start; p<start+200; p++)); do
+    if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$"; then
+      printf '%s' "$p"; return 0
+    fi
+  done
+  return 1
+}
+
+rand_hex() { openssl rand -hex 32; }
+rand_pw()  { openssl rand -base64 24 | tr -d '/+=' | cut -c1-20; }
+
+ask() {
+  # ask <变量名> <提示> <默认值>
+  local __var="$1" __prompt="$2" __default="${3:-}" __reply
+  if [[ "$ASSUME_YES" == "true" ]]; then
+    printf -v "$__var" '%s' "$__default"
+    return
+  fi
+  if [[ ! -t 0 ]]; then
+    printf -v "$__var" '%s' "$__default"
+    return
+  fi
+  if [[ -n "$__default" ]]; then
+    read -r -p "$__prompt [$__default]: " __reply || true
+    printf -v "$__var" '%s' "${__reply:-$__default}"
+  else
+    while true; do
+      read -r -p "$__prompt: " __reply || true
+      [[ -n "$__reply" ]] && break
+      printf '  不能为空\n'
+    done
+    printf -v "$__var" '%s' "$__reply"
+  fi
+}
+
+ask_yn() {
+  local __prompt="$1" __default="${2:-y}" __reply
+  if [[ "$ASSUME_YES" == "true" ]]; then return 0; fi
+  if [[ ! -t 0 ]]; then
+    [[ "$__default" =~ ^[Yy] ]]
+    return
+  fi
+  read -r -p "$__prompt [${__default}]: " __reply || true
+  __reply="${__reply:-$__default}"
+  [[ "$__reply" =~ ^[Yy] ]]
+}
+
+# =============================================================================
+# Caddyfile 生成
+# =============================================================================
+write_caddyfile() {
+  local oc_dom="$1" api_dom="$2" email="$3" ip_mode="$4" http_port="${5:-8080}" api_port="${6:-8081}"
+
+  mkdir -p "$CADDY_DIR"
+  [[ -f "$CADDY_FILE" ]] && cp "$CADDY_FILE" "$CADDY_FILE.bak.$(date +%s)"
+
+  {
+    cat <<EOF
+# 由 ocstack 自动生成 — $(date -Iseconds)
+# 不要直接改这个文件，改 .env 后运行 ./ocstack install 重新生成
+{
+	email ${email:-admin@example.com}
+	admin off
+}
+
+EOF
+
+    if [[ "$ip_mode" == "true" ]]; then
+      # 无域名：纯 HTTP。Let's Encrypt 不支持纯 IP 证书，只能退化成明文。
+      # 单端口 + 路径前缀区分两个服务。
+      cat <<EOF
+# IP 模式：无 HTTPS（Let's Encrypt 不为纯 IP 签证书）
+# 这个模式仅适合临时试用，尽快配域名切到 HTTPS
+:${http_port} {
+	encode gzip
+
+	# OpenChamber 走根路径
+	handle {
+		reverse_proxy openchamber:3000 {
+			flush_interval -1
+			transport http {
+				read_timeout 3600s
+				write_timeout 3600s
+			}
+		}
+	}
+
+	header {
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}
+
+# Sub2API 单独一个端口，方便客户端填 baseURL
+:${api_port} {
+	encode gzip
+	reverse_proxy sub2api:8080 {
+		flush_interval -1
+		transport http {
+			read_timeout 900s
+			write_timeout 900s
+		}
+	}
+	header {
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}
+EOF
+    else
+      # 域名模式：自动 HTTPS + 自动续期（Caddy 内置 ACME）
+      if [[ -n "$oc_dom" ]]; then
+        cat <<EOF
+# ---- OpenChamber ----
+${oc_dom} {
+	encode gzip zstd
+
+	reverse_proxy openchamber:3000 {
+		# SSE 必须立即 flush，否则界面发消息转圈
+		flush_interval -1
+		transport http {
+			read_timeout 3600s
+			write_timeout 3600s
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# 证书过期前 30 天自动续期由 Caddy 处理，无需 cron
+}
+
+EOF
+      fi
+
+      if [[ -n "$api_dom" ]]; then
+        cat <<EOF
+# ---- Sub2API ----
+${api_dom} {
+	encode gzip zstd
+
+	# 粘性会话依赖 session_id 这个带下划线的头，
+	# Caddy 默认原样透传（Nginx 需要 underscores_in_headers on）
+	reverse_proxy sub2api:8080 {
+		flush_interval -1
+		transport http {
+			read_timeout 900s
+			write_timeout 900s
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}
+
+EOF
+      fi
+    fi
+  } > "$CADDY_FILE"
+
+  docker run --rm -v "$CADDY_FILE:/etc/caddy/Caddyfile:ro" caddy:2-alpine \
+    caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
+    && ok "Caddyfile 语法校验通过" \
+    || warn "Caddyfile 校验未通过，检查 $CADDY_FILE"
+}
+
+# =============================================================================
+# install
+# =============================================================================
+cmd_install() {
+  local DOMAINS=""
+
+  # 解析参数
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y) ASSUME_YES="true"; shift ;;
+      --oc-domain)  OC_DOMAIN_ARG="${2:-}"; shift 2 ;;
+      --api-domain) API_DOMAIN_ARG="${2:-}"; shift 2 ;;
+      --email)      EMAIL_ARG="${2:-}"; shift 2 ;;
+      *) die "未知参数：$1" ;;
+    esac
+  done
+
+  printf '\n%s%s oc-stack 安装器 v%s %s\n' "$B" "$CYA" "$OCSTACK_VERSION" "$R"
+  printf '%s Sub2API + OpenCode + OpenChamber + Caddy（全 Docker）%s\n\n' "$DIM" "$R"
+
+  # ---- 1. 环境 ----
+  head1 "1/7 检查环境"
+  if ! command -v docker >/dev/null 2>&1; then
+    info "未安装 Docker，正在安装"
+    curl -fsSL https://get.docker.com | sh >/dev/null 2>&1 || die "Docker 安装失败"
+    systemctl enable --now docker >/dev/null 2>&1 || true
+  fi
+  need_docker
+  ok "Docker $(docker --version | cut -d, -f1)"
+  ok "Compose $(docker compose version --short 2>/dev/null || echo ok)"
+
+  # 端口占用预检：80/443 被 nginx 之类占了会导致 caddy 起不来
+  local port_in_use=""
+  for p in 80 443; do
+    if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$"; then
+      port_in_use="${port_in_use} ${p}"
+    fi
+  done
+  if [[ -n "$port_in_use" ]]; then
+    warn "端口被占用：${port_in_use}"
+    warn "占用者：$(ss -tlnp 2>/dev/null | grep -E ':(80|443) ' | sed -E 's/.*users:\(\("([^"]+)".*/(\1)/' | sort -u | tr '\n' ' ')"
+    cat <<'EOM'
+  两个选择：
+    A) 停掉占用 80/443 的服务（如 nginx），让 Caddy 接管
+    B) 让 Caddy 用别的端口，前面那层反代指过来
+EOM
+    local free_h free_s
+    free_h="$(free_port 8080)" || die "找不到空闲端口"
+    free_s="$(free_port $((free_h + 100)))" || die "找不到空闲端口"
+    if [[ "$ASSUME_YES" == "true" ]]; then
+      warn "--yes 模式：自动改用 ${free_h}/${free_s}，由现有反代转发"
+      CADDY_HTTP_PORT="$free_h"; CADDY_HTTPS_PORT="$free_s"
+    else
+      if ask_yn "  改用 ${free_h}/${free_s}（需你自己在前置反代里转发）？" "y"; then
+        CADDY_HTTP_PORT="$free_h"; CADDY_HTTPS_PORT="$free_s"
+      else
+        die "请先释放 80/443 后重试：sudo systemctl stop nginx"
+      fi
+    fi
+  fi
+
+  local mem_mb
+  mem_mb=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
+  if (( mem_mb < 3500 )); then
+    warn "内存 ${mem_mb}MB。当前栈（PG+Redis+Sub2API+OpenChamber）建议 4GB 以上"
+  else
+    ok "内存 ${mem_mb}MB"
+  fi
+
+  # ---- 2. 域名 ----
+  head1 "2/7 配置域名"
+  cat <<'EOF'
+  需要几个域名？
+
+    OpenChamber 域名   —— 你平时打开网页用的，比如 oc.example.com
+    Sub2API 域名       —— 网关地址，供 OpenCode/其他客户端调用，比如 api.example.com
+
+  两个都填：最推荐，各自独立、证书独立
+  只填第一个：Sub2API 走内部网络，只给本机的 OpenChamber 用
+  两个都空：IP 模式，用 HTTP 访问，无加密（不推荐）
+
+EOF
+
+  local OC_DOMAIN="${OC_DOMAIN_ARG:-}" API_DOMAIN="${API_DOMAIN_ARG:-}" ACME_EMAIL="${EMAIL_ARG:-}"
+
+  [[ -f "$ENV_FILE" ]] && { OC_DOMAIN="${OC_DOMAIN:-$(envget OC_DOMAIN)}"; API_DOMAIN="${API_DOMAIN:-$(envget API_DOMAIN)}"; ACME_EMAIL="${ACME_EMAIL:-$(envget ACME_EMAIL)}"; }
+
+  ask OC_DOMAIN    "  OpenChamber 域名（留空跳过）" "$OC_DOMAIN"
+  ask API_DOMAIN   "  Sub2API 域名（留空跳过）"     "$API_DOMAIN"
+
+  local IP_MODE="false"
+  if [[ -z "$OC_DOMAIN" ]]; then
+    IP_MODE="true"
+    warn "未填 OpenChamber 域名 → 进入 IP 模式（HTTP，无加密）"
+  else
+    ask ACME_EMAIL "  证书通知邮箱" "$ACME_EMAIL"
+    [[ "$ACME_EMAIL" == *@* ]] || die "邮箱格式不对：$ACME_EMAIL"
+  fi
+
+  if [[ -n "$OC_DOMAIN" || -n "$API_DOMAIN" ]]; then
+    head1 "  DNS 检查"
+    local d ip
+    for d in $OC_DOMAIN $API_DOMAIN; do
+      [[ -z "$d" ]] && continue
+      ip="$(getent hosts "$d" 2>/dev/null | awk '{print $1; exit}' || true)"
+      if [[ -z "$ip" ]]; then
+        warn "$d 尚未解析。请先在 DNS 里加 A 记录指向本机公网 IP"
+        warn "证书申请会失败，直到解析生效"
+      else
+        ok "$d → $ip"
+      fi
+    done
+  fi
+
+  # ---- 3. 账号密码 ----
+  head1 "3/7 生成账号与密钥"
+  local OPENCHAMBER_UI_PASSWORD ADMIN_EMAIL ADMIN_PASSWORD
+  OPENCHAMBER_UI_PASSWORD="$(envget OPENCHAMBER_UI_PASSWORD)"
+  [[ -z "$OPENCHAMBER_UI_PASSWORD" ]] && OPENCHAMBER_UI_PASSWORD="$(rand_pw)"
+  ADMIN_EMAIL="$(envget ADMIN_EMAIL)"; [[ -z "$ADMIN_EMAIL" ]] && ADMIN_EMAIL="admin@oc.local"
+  ADMIN_PASSWORD="$(envget ADMIN_PASSWORD)"; [[ -z "$ADMIN_PASSWORD" ]] && ADMIN_PASSWORD="$(rand_pw)"
+
+  # 实测：Sub2API 要求管理员密码 >= 8 位
+  if (( ${#ADMIN_PASSWORD} < 8 )); then
+    warn "管理员密码不足 8 位，重新生成"
+    ADMIN_PASSWORD="$(rand_pw)"
+  fi
+  (( ${#ADMIN_PASSWORD} >= 8 )) || ADMIN_PASSWORD="$(rand_pw)x9"
+
+  # ---- 4. 上游 ----
+  head1 "4/7 上游模型（可选，可稍后用 ./ocstack bootstrap 补）"
+  local UPSTREAM_URL="" UPSTREAM_KEY="" SUB2API_MODEL="deepseek/deepseek-v4.1-flash"
+  cat <<'EOF'
+  如果你的上游是现成的 OpenAI 兼容 API（DeepSeek / 官方中转 / 自建网关），
+  填进来安装时就会自动建好分组、账号和密钥。
+
+  没有就两个都回车跳过，装完手动在后台配。
+
+EOF
+  if [[ "$ASSUME_YES" != "true" ]] && ask_yn "  现在就配置上游？" "n"; then
+    ask UPSTREAM_URL "  上游 Base URL（不含 /v1）" ""
+    ask UPSTREAM_KEY "  上游 API Key" ""
+    ask SUB2API_MODEL "  模型 ID" "deepseek/deepseek-v4.1-flash"
+  fi
+
+  # ---- 5. 写 .env ----
+  head1 "5/7 写入配置"
+
+  # IP 模式需要两个额外入口，和 Caddy 的端口错开
+  local IP_HTTP_PORT IP_API_PORT
+  if [[ "$IP_MODE" == "true" ]]; then
+    IP_HTTP_PORT="$(free_port $((CADDY_HTTP_PORT + 2)))"
+    IP_API_PORT="$(free_port $((IP_HTTP_PORT + 1)))"
+  else
+    IP_HTTP_PORT="8080"
+    IP_API_PORT="8081"
+  fi
+  [[ -f "$ENV_FILE" ]] && { cp "$ENV_FILE" "$ENV_FILE.bak.$(date +%s)"; warn "已有 .env，已备份"; }
+
+  {
+    echo "# oc-stack 配置 — $(date -Iseconds)"
+    echo "# 由 ./ocstack install 生成。改完执行 ./ocstack restart"
+    echo
+    echo "# ---- 域名 ----"
+    echo "OC_DOMAIN=${OC_DOMAIN}"
+    echo "API_DOMAIN=${API_DOMAIN}"
+    echo "ACME_EMAIL=${ACME_EMAIL}"
+    echo "IP_MODE=${IP_MODE}"
+    echo
+    echo "# ---- 版本（升级时改这里）----"
+    echo "OPENCODE_VERSION=${OPENCODE_VERSION:-2.2.6}"
+    echo "OPENCHAMBER_VERSION=${OPENCHAMBER_VERSION:-2.7.0}"
+    echo
+    echo "# ---- OpenChamber ----"
+    echo "OPENCHAMBER_UI_PASSWORD=${OPENCHAMBER_UI_PASSWORD}"
+    echo
+    echo "# ---- Sub2API 管理员 ----"
+    echo "ADMIN_EMAIL=${ADMIN_EMAIL}"
+    echo "ADMIN_PASSWORD=${ADMIN_PASSWORD}"
+    echo
+    echo "# ---- 数据库 ----"
+    echo "POSTGRES_USER=sub2api"
+    echo "POSTGRES_DB=sub2api"
+    echo "POSTGRES_PASSWORD=$(rand_hex)"
+    echo "REDIS_PASSWORD=$(rand_hex)"
+    echo
+    echo "# ---- 固定密钥（不要删，删了所有人被登出、2FA 失效）----"
+    echo "JWT_SECRET=$(rand_hex)"
+    echo "TOTP_ENCRYPTION_KEY=$(rand_hex)"
+    echo
+    echo "# ---- 模型 ----"
+    echo "SUB2API_MODEL=${SUB2API_MODEL:-deepseek/deepseek-v4.1-flash}"
+    echo "SUB2API_MODEL_ALIAS=deepseek-v4.1-flash"
+    echo "SUB2API_MODEL_NAME=DeepSeek V4.1 Flash"
+    echo "SUB2API_API_KEY="
+    echo
+    echo "# ---- 反代端口（80/443 被占用时自动改过）----"
+    echo "CADDY_HTTP_PORT=${CADDY_HTTP_PORT:-80}"
+    echo "CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT:-443}"
+    echo "# IP 模式的额外入口端口（和上面错开，避免冲突）"
+    echo "HTTP_PORT=${IP_HTTP_PORT}"
+    echo "API_HTTP_PORT=${IP_API_PORT}"
+    echo
+    echo "# ---- 其他 ----"
+    echo "TZ=Asia/Shanghai"
+  } > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  ok ".env 已写入（600）"
+
+  # 记录上游参数给 bootstrap 用（不写进 .env，避免混入 compose 变量）
+  if [[ -n "$UPSTREAM_URL" ]]; then
+    cat > "$ROOT/.upstream" <<EOF
+UPSTREAM_URL=${UPSTREAM_URL}
+UPSTREAM_KEY=${UPSTREAM_KEY}
+EOF
+    chmod 600 "$ROOT/.upstream"
+    ok "上游参数已记录到 .upstream（600）"
+  fi
+
+  # ---- 6. 生成 Caddyfile ----
+  head1 "6/7 生成反代配置"
+  write_caddyfile "$OC_DOMAIN" "$API_DOMAIN" "$ACME_EMAIL" "$IP_MODE" "$IP_HTTP_PORT" "$IP_API_PORT"
+
+  # ---- 7. 构建并启动 ----
+  head1 "7/7 构建并启动"
+  info "构建 OpenChamber 镜像（首次约 3-5 分钟）"
+  dc build openchamber 2>&1 | tail -3
+
+  info "启动全部服务"
+  dc up -d 2>&1 | tail -5
+
+  info "等待服务就绪"
+  local i
+  for i in $(seq 1 60); do
+    if dc ps --format json 2>/dev/null | grep -q '"Health":"healthy"'; then
+      :
+    fi
+    if docker exec oc-sub2api wget -q -T 3 -O /dev/null http://localhost:8080/health 2>/dev/null; then
+      ok "Sub2API 就绪"
+      break
+    fi
+    sleep 3
+  done
+
+  # 自动 bootstrap
+  if [[ -n "$UPSTREAM_URL" && -n "$UPSTREAM_KEY" ]]; then
+    head1 "自动配置 Sub2API"
+    cmd_bootstrap --from-file || warn "自动配置未完全成功，可稍后重跑 ./ocstack bootstrap"
+  fi
+
+  print_summary
+}
+
+# =============================================================================
+# bootstrap —— 自动完成 Sub2API 后台配置
+# =============================================================================
+cmd_bootstrap() {
+  need_env
+  local FROM_FILE="false"
+  [[ "${1:-}" == "--from-file" ]] && FROM_FILE="true"
+
+  local UPSTREAM_URL="" UPSTREAM_KEY="" MODEL GROUP_NAME="oc-stack" KEY_NAME="oc-stack" BALANCE="100"
+
+  if [[ "$FROM_FILE" == "true" && -f "$ROOT/.upstream" ]]; then
+    # shellcheck disable=SC1091
+    . "$ROOT/.upstream"
+  else
+    ask UPSTREAM_URL "上游 Base URL（不含 /v1，留空跳过）" "$(grep -E '^UPSTREAM_URL=' "$ROOT/.upstream" 2>/dev/null | cut -d= -f2- || true)"
+    [[ -n "$UPSTREAM_URL" ]] && ask UPSTREAM_KEY "上游 API Key" ""
+  fi
+  MODEL="$(envget SUB2API_MODEL)"; MODEL="${MODEL:-deepseek/deepseek-v4.1-flash}"
+
+  local EMAIL PASS
+  EMAIL="$(envget ADMIN_EMAIL)"
+  PASS="$(envget ADMIN_PASSWORD)"
+
+  # 从宿主机通过 Caddy 暴露的 Sub2API 端口访问网关
+  local GW
+  GW="http://127.0.0.1:$(envget API_HTTP_PORT)"
+  [[ "$(envget IP_MODE)" == "true" ]] && GW="http://127.0.0.1:$(envget API_HTTP_PORT)"
+  local EXEC=(docker exec oc-sub2api)
+
+  info "等待网关"
+  local i
+  for i in $(seq 1 40); do
+    if "${EXEC[@]}" wget -q -T 3 -O /dev/null "$GW/health" 2>/dev/null; then break; fi
+    sleep 3
+  done
+
+  # 容器里有 wget 但没有 jq，用 python 解析
+  local pyjq='import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(""); sys.exit(0)
+'
+  _jget() {
+    # _jget <json> <python 表达式，用 d 表示根>
+    python3 -c "
+import sys,json
+try:
+    d=json.loads(sys.argv[1])
+    v=$2
+    print('' if v is None else v)
+except Exception:
+    print('')
+" "$1"
+  }
+
+  info "登录管理员"
+  local LOGIN TOKEN
+  LOGIN="$(curl -sS -m 20 -X POST "$GW/api/v1/auth/login" \
+    -H 'Content-Type: application/json' \
+    -d "$(python3 -c "import json,sys;print(json.dumps({'email':sys.argv[1],'password':sys.argv[2]}))" "$EMAIL" "$PASS")" 2>/dev/null \
+    || "${EXEC[@]}" wget -qO- --header='Content-Type: application/json' \
+        --post-data="{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" "$GW/api/v1/auth/login" 2>/dev/null || true)"
+  TOKEN="$(_jget "$LOGIN" "d.get('data',{}).get('access_token')")"
+  [[ -n "$TOKEN" ]] || die "登录失败。检查 .env 里的 ADMIN_EMAIL / ADMIN_PASSWORD 是否和数据库里一致
+（改过 POSTGRES_PASSWORD 或重建过 postgres 会不一致）"
+  ok "已登录 $EMAIL"
+
+  local AUTH=(-H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json')
+
+  # 1. 合规确认（实测坑：不传 language 会按英文校验）
+  info "接受合规确认"
+  local ACK
+  ACK="$(curl -sS -m 20 -X POST "$GW/api/v1/admin/compliance/accept" "${AUTH[@]}" \
+    -d '{"phrase":"我已阅读、理解并同意 Sub2API 部署与运营合规承诺","language":"zh"}')"
+  if echo "$ACK" | grep -q '"code":0'; then
+    ok "合规确认已记录"
+  else
+    local ACK2
+    ACK2="$(curl -sS -m 20 -X POST "$GW/api/v1/admin/compliance/accept" "${AUTH[@]}" \
+      -d '{"phrase":"I have read, understood, and agree to the Sub2API Deployment and Operation Compliance Commitment","language":"en"}')"
+    echo "$ACK2" | grep -q '"code":0' && ok "合规确认已记录（英文）" || warn "合规确认：$(echo "$ACK" | head -c 150)"
+  fi
+
+  # 2. 分组
+  local GRP_JSON GID
+  GRP_JSON="$(curl -sS -m 20 "$GW/api/v1/admin/groups?page=1&page_size=200" "${AUTH[@]}")"
+  # 变量名不能用 GROUPS —— 那是 bash 的保留变量，赋值会被静默丢弃
+  GID="$(_jget "$GRP_JSON" "next((i['id'] for i in d.get('data',{}).get('items',[]) if i.get('name')=='$GROUP_NAME'), None)")"
+  if [[ -n "$GID" ]]; then
+    ok "分组已存在（id=$GID）"
+  else
+    info "创建分组 $GROUP_NAME（平台 openai）"
+    local GR
+    GR="$(curl -sS -m 20 -X POST "$GW/api/v1/admin/groups" "${AUTH[@]}" \
+      -d "{\"name\":\"$GROUP_NAME\",\"description\":\"ocstack 自动创建\",\"platform\":\"openai\",\"rate_multiplier\":1,\"subscription_type\":\"standard\"}")"
+    GID="$(_jget "$GR" "d.get('data',{}).get('id')")"
+    [[ -n "$GID" ]] || die "创建分组失败：$(echo "$GR" | head -c 250)"
+    ok "分组已创建（id=$GID）"
+  fi
+
+  # 3. 上游账号
+  if [[ -n "$UPSTREAM_URL" && -n "$UPSTREAM_KEY" ]]; then
+    local ACC_JSON AID
+    ACC_JSON="$(curl -sS -m 20 "$GW/api/v1/admin/accounts?page=1&page_size=200" "${AUTH[@]}")"
+    AID="$(_jget "$ACC_JSON" "next((i['id'] for i in d.get('data',{}).get('items',[]) if i.get('credentials',{}).get('base_url')=='$UPSTREAM_URL'), None)")"
+
+    if [[ -n "$AID" ]]; then
+      ok "上游账号已存在（id=$AID）"
+      # 已有账号可能不属于本次分组，必须并进去，否则密钥查不到模型
+      local CUR
+      CUR="$(_jget "$ACC_JSON" "','.join(str(x) for i in d.get('data',{}).get('items',[]) if i.get('id')==$AID for x in (i.get('group_ids') or []))")"
+      if echo ",${CUR}," | grep -q ",${GID},"; then
+        ok "账号已归属分组 $GID"
+      else
+        info "把账号并入分组 $GID"
+        local NEW
+        NEW="$(python3 -c "
+import sys
+s=set(x for x in sys.argv[1].split(',') if x.isdigit())
+s.add(int('$GID'))
+print(','.join(str(x) for x in sorted(s)))
+" "$CUR")"
+        if curl -sS -m 30 -X PUT "$GW/api/v1/admin/accounts/$AID" "${AUTH[@]}" \
+             -d "{\"group_ids\":[${NEW}]}" | grep -q '"code":0'; then
+          ok "已并入分组"
+        else
+          warn "并入分组失败，请到后台手动勾选账号 id=$AID 到分组 $GROUP_NAME"
+        fi
+      fi
+    else
+      info "创建上游账号 → $UPSTREAM_URL"
+      local BODY AR
+      BODY="$(python3 -c "
+import json,sys
+print(json.dumps({
+  'name':'upstream-openai','platform':'openai','type':'apikey',
+  'credentials':{'api_key':sys.argv[1],'base_url':sys.argv[2],
+                 'model_mapping':{sys.argv[3]:sys.argv[3]}},
+  'extra':{},'group_ids':[int(sys.argv[4])],'concurrency':5,'priority':1
+}))" "$UPSTREAM_KEY" "$UPSTREAM_URL" "$MODEL" "$GID")"
+      AR="$(curl -sS -m 30 -X POST "$GW/api/v1/admin/accounts" "${AUTH[@]}" \
+        -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)" -d "$BODY")"
+      AID="$(_jget "$AR" "d.get('data',{}).get('id')")"
+      [[ -n "$AID" ]] || die "创建上游账号失败：$(echo "$AR" | head -c 300)"
+      ok "上游账号已创建（id=$AID）"
+    fi
+
+    info "测试上游连通（会真实请求一次）"
+    local TEST
+    TEST="$(curl -sS -m 90 -X POST "$GW/api/v1/admin/accounts/$AID/test" "${AUTH[@]}" \
+      -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)" \
+      -d "$(python3 -c "import json,sys;print(json.dumps({'model_id':sys.argv[1]}))" "$MODEL")" 2>&1 || true)"
+    if echo "$TEST" | grep -q '"type":"test_complete"\|"success":true'; then
+      ok "上游连通"
+    else
+      warn "上游测试未通过：$(echo "$TEST" | grep -o '"error":"[^"]*"' | head -1 | cut -c1-180)"
+      warn "常见原因：base_url 少了或多了 /v1、key 无效、模型名不对"
+    fi
+  else
+    warn "未提供上游，跳过账号创建。请到后台手动添加并归属分组 $GROUP_NAME"
+  fi
+
+  # 4. 余额（余额为 0 时所有请求 402）
+  if [[ "$BALANCE" != "0" ]]; then
+    info "设置余额 $BALANCE（否则所有请求被拦截）"
+    curl -sS -m 20 -X POST "$GW/api/v1/admin/users/1/balance" "${AUTH[@]}" \
+      -d "{\"balance\":$BALANCE,\"operation\":\"add\",\"remark\":\"ocstack 初始化\"}" \
+      | grep -q '"code":0' && ok "余额已设置" || warn "设置余额失败，请到后台手动处理"
+  fi
+
+  # 5. API 密钥
+  local KEY_JSON SK
+  KEY_JSON="$(curl -sS -m 20 "$GW/api/v1/keys?page=1&page_size=200" "${AUTH[@]}")"
+  # 注意：/api/v1/keys 返回 {data:{items:[]}}，不是 {data:[]}
+  SK="$(_jget "$KEY_JSON" "next((i['key'] for i in (d.get('data',{}).get('items') or d.get('data') or []) if i.get('name')=='$KEY_NAME'), None)")"
+  if [[ -n "$SK" ]]; then
+    ok "密钥已存在"
+  else
+    info "创建 API 密钥"
+    local KR
+    KR="$(curl -sS -m 20 -X POST "$GW/api/v1/keys" "${AUTH[@]}" \
+      -d "{\"name\":\"$KEY_NAME\",\"group_id\":$GID}")"
+    SK="$(_jget "$KR" "d.get('data',{}).get('key')")"
+    [[ -n "$SK" ]] || die "创建密钥失败：$(echo "$KR" | head -c 250)"
+    ok "密钥已创建"
+  fi
+
+  setenv SUB2API_API_KEY "$SK"
+  ok "密钥已写入 .env"
+
+  # 6. 端到端
+  info "端到端自测"
+  local MODELS
+  MODELS="$(curl -sS -m 20 "$GW/v1/models" -H "Authorization: Bearer $SK")"
+  if echo "$MODELS" | grep -q '"id"'; then
+    ok "GET /v1/models 正常"
+  else
+    die "GET /v1/models 失败：$(echo "$MODELS" | head -c 250)"
+  fi
+  local CHAT
+  CHAT="$(curl -sS -m 90 "$GW/v1/chat/completions" -H "Authorization: Bearer $SK" \
+    -H 'Content-Type: application/json' \
+    -d "$(python3 -c "import json,sys;print(json.dumps({'model':sys.argv[1],'messages':[{'role':'user','content':'只回两个字：收到'}],'max_tokens':100}))" "$MODEL")")"
+  if echo "$CHAT" | grep -q '"content"'; then
+    ok "对话成功"
+  else
+    die "对话失败：$(echo "$CHAT" | head -c 300)"
+  fi
+
+  # 7. 让 OpenChamber 读到新密钥
+  info "重启 OpenChamber 以加载新密钥"
+  dc up -d --force-recreate openchamber >/dev/null 2>&1 || \
+    docker restart oc-openchamber >/dev/null
+  ok "已重启"
+
+  printf '\n%s%s初始化完成%s\n\n' "$B" "$GRN" "$R"
+  printf '  API Key   %s...\n' "${SK:0:16}"
+  printf '  分组      %s (id=%s)\n' "$GROUP_NAME" "$GID"
+  printf '  模型      %s\n\n' "$MODEL"
+}
+
+# =============================================================================
+# verify
+# =============================================================================
+cmd_verify() {
+  need_env
+  local PASS=0 FAIL=0
+  p() { printf '%s  PASS%s %s\n' "$GRN" "$R" "$*"; PASS=$((PASS+1)); }
+  f() { printf '%s  FAIL%s %s\n' "$RED" "$R" "$*"; FAIL=$((FAIL+1)); }
+
+  head1 "1. 容器"
+  local bad=0
+  while read -r name state health; do
+    [[ -z "$name" ]] && continue
+    if [[ "$state" != "running" ]]; then
+      f "$name 未运行（$state）"; bad=1; continue
+    fi
+    if [[ -n "$health" && "$health" != "healthy" && "$health" != "none" ]]; then
+      f "$name 健康检查 $health"; bad=1; continue
+    fi
+    p "$name running${health:+ / $health}"
+  done < <(docker ps -a --filter "label=com.docker.compose.project=oc-stack" \
+            --format '{{.Names}} {{.State}} {{.Status}}' 2>/dev/null | \
+            awk '{n=$0; sub(/^[^ ]+ /,"",n); split($0,a," "); print a[1], a[2], (index($0,"(healthy)")?"healthy":(index($0,"(unhealthy)")?"unhealthy":"none"))}')
+
+  head1 "2. 端口暴露"
+  if docker port oc-caddy 2>/dev/null | grep -qE '^443|:443'; then
+    p "Caddy 已暴露 443"
+  else
+    f "Caddy 未暴露 443"
+  fi
+  if docker port oc-openchamber 2>/dev/null | grep -qE '^3000|:3000'; then
+    f "OpenChamber 的 3000 端口暴露到宿主机（应该只走 caddy）"
+  else
+    p "OpenChamber 端口未暴露"
+  fi
+  if docker port oc-sub2api 2>/dev/null | grep -qE '^8080|:8080'; then
+    f "Sub2API 的 8080 端口暴露到宿主机"
+  else
+    p "Sub2API 端口未暴露"
+  fi
+
+  head1 "3. 网关内部可达"
+  if docker exec oc-sub2api wget -q -T 5 -O /dev/null http://localhost:8080/health 2>/dev/null; then
+    p "Sub2API 健康检查通过"
+  else
+    f "Sub2API 不可达"
+  fi
+
+  head1 "4. API Key"
+  local KEY
+  KEY="$(envget SUB2API_API_KEY)"
+  if [[ -z "$KEY" ]]; then
+    f "SUB2API_API_KEY 未设置（运行 ./ocstack bootstrap）"
+  else
+    p "API Key 已配置（${KEY:0:10}...）"
+    local RESP
+    RESP="$(docker exec oc-sub2api wget -qO- --header="Authorization: Bearer $KEY" http://localhost:8080/v1/models 2>/dev/null || true)"
+    if echo "$RESP" | grep -q 'INSUFFICIENT_BALANCE'; then
+      f "网关余额为 0，所有请求被拦截"
+    elif echo "$RESP" | grep -q '"id"'; then
+      p "模型列表可读"
+      echo "$RESP" | grep -q "$(envget SUB2API_MODEL)" && p "目标模型存在" || f "模型列表里没有 $(envget SUB2API_MODEL)"
+    else
+      f "模型列表失败：$(echo "$RESP" | head -c 150)"
+    fi
+  fi
+
+  head1 "5. OpenChamber 配置"
+  if docker exec oc-openchamber test -f /home/openchamber/.config/opencode/opencode.json; then
+    p "opencode.json 存在"
+    local cfg
+    cfg="$(docker exec oc-openchamber cat /home/openchamber/.config/opencode/opencode.json)"
+    echo "$cfg" | grep -q 'max_completion_tokens' && p "maxTokensField 正确" || f "缺少 maxTokensField（长回答会 400）"
+    echo "$cfg" | grep -q 'reasoning_content' && p "reasoningField 正确" || f "缺少 reasoningField"
+  else
+    f "opencode.json 不存在"
+  fi
+
+  head1 "6. 端到端工具调用"
+  if [[ -n "$KEY" ]]; then
+    local OUT
+    OUT="$(docker exec -e SUB2API_API_KEY="$KEY" oc-openchamber bash -lc \
+      "cd /tmp && printf 'def add(a,b):\n    return a+b\n' > m.py && \
+       timeout 120 opencode run --standalone --auto --model sub2api/$(envget SUB2API_MODEL_ALIAS || echo deepseek-v4.1-flash) \
+       '读 m.py 并运行 python3 -c \"import m;print(m.add(2,3))\"' 2>&1 | tail -20" 2>/dev/null || true)"
+    if echo "$OUT" | grep -q '5'; then
+      p "工具调用正常"
+    else
+      f "工具调用失败：$(echo "$OUT" | tail -2 | tr '\n' ' ' | head -c 150)"
+    fi
+  else
+    f "缺少 API Key，跳过"
+  fi
+
+  printf '\n%s────────────────────────────────%s\n' "$DIM" "$R"
+  printf '  通过 %s%d%s   失败 %s%d%s\n\n' "$GRN" "$PASS" "$R" "$RED" "$FAIL" "$R"
+  (( FAIL == 0 )) && printf '%s  全部通过%s\n\n' "$GRN" "$R" && return 0
+  printf '%s  有 %d 项失败%s\n\n' "$RED" "$FAIL" "$R"
+  return 1
+}
+
+# =============================================================================
+# 其他命令
+# =============================================================================
+cmd_up()       { need_env; dc up -d "$@"; }
+cmd_down()     { need_env; dc down; }
+cmd_restart()  { need_env; dc restart; }
+cmd_logs()     { need_env; dc logs -f --tail=100 "$@"; }
+
+cmd_status() {
+  need_env
+  head1 "容器"
+  dc ps
+  head1 "访问地址"
+  local oc api
+  oc="$(envget OC_DOMAIN)"; api="$(envget API_DOMAIN)"
+  if [[ -n "$oc" ]]; then
+    printf '  OpenChamber  %shttps://%s%s\n' "$GRN" "$oc" "$R"
+  else
+    printf '  OpenChamber  %shttp://<服务器IP>:8080%s（IP 模式）\n' "$YEL" "$R"
+  fi
+  if [[ -n "$api" ]]; then
+    printf '  Sub2API      %shttps://%s%s\n' "$GRN" "$api" "$R"
+  else
+    printf '  Sub2API      %s内部网络，未对外%s\n' "$DIM" "$R"
+  fi
+  head1 "证书"
+  docker exec oc-caddy ls /data/caddy/certificates 2>/dev/null | head -5 || echo "  （尚未签发）"
+  head1 "磁盘"
+  du -sh "$ROOT"/data/* 2>/dev/null | sort -h || true
+}
+
+cmd_cert() {
+  need_env
+  head1 "证书状态"
+  # Caddy 自动续期，这里只是把已签发的证书列出来
+  docker exec oc-caddy sh -c '
+    find /data/caddy/certificates -name "*.crt" 2>/dev/null | while read -r f; do
+      echo "--- $f"
+      openssl x509 -in "$f" -noout -subject -enddate 2>/dev/null | sed "s/^/    /"
+    done
+  ' || warn "无法读取证书"
+  echo
+  info "Caddy 会在证书到期前 30 天自动续期，无需 cron"
+  info "续期日志：./ocstack logs caddy | grep -i renew"
+}
+
+cmd_upgrade() {
+  need_env
+  head1 "升级"
+  cp "$ENV_FILE" "$ENV_FILE.bak.$(date +%s)"
+
+  local oc_ver oc_c_ver
+  oc_ver="${1:-}"
+  oc_c_ver="${2:-}"
+
+  info "检查最新版本"
+  local latest_oc latest_ch
+  latest_oc="$(curl -s https://registry.npmjs.org/@opencode/cli/latest | python3 -c "import json,sys;print(json.load(sys.stdin)['version'])" 2>/dev/null || true)"
+  latest_ch="$(curl -s https://registry.npmjs.org/@openchamber/web/latest | python3 -c "import json,sys;print(json.load(sys.stdin)['version'])" 2>/dev/null || true)"
+
+  [[ -n "$oc_ver" ]] || { printf '  OpenCode  当前 %s  最新 %s\n' "$(envget OPENCODE_VERSION)" "${latest_oc:-?}"; oc_ver="${latest_oc:-$(envget OPENCODE_VERSION)}"; }
+  [[ -n "$oc_c_ver" ]] || { printf '  Chamber   当前 %s  最新 %s\n' "$(envget OPENCHAMBER_VERSION)" "${latest_ch:-?}"; oc_c_ver="${latest_ch:-$(envget OPENCHAMBER_VERSION)}"; }
+
+  if [[ "$ASSUME_YES" != "true" ]] && ! ask_yn "  升级到 OpenCode $oc_ver / OpenChamber $oc_c_ver？" "y"; then
+    info "已取消"; return
+  fi
+
+  setenv OPENCODE_VERSION "$oc_ver"
+  setenv OPENCHAMBER_VERSION "$oc_c_ver"
+
+  info "拉取 Sub2API / Caddy 新镜像"
+  dc pull caddy sub2api postgres redis 2>&1 | tail -3
+
+  info "重建 OpenChamber 镜像"
+  dc build --no-cache openchamber 2>&1 | tail -3
+
+  info "滚动重启"
+  dc up -d 2>&1 | tail -3
+
+  ok "升级完成"
+  info "数据未动。回滚：编辑 .env 里的版本号后重跑 ./ocstack upgrade <版本>"
+}
+
+cmd_uninstall() {
+  need_env
+  local PURGE="false" FORCE="false"
+  for a in "$@"; do
+    case "$a" in
+      --purge) PURGE="true" ;;
+      --yes|-y) FORCE="true" ;;
+    esac
+  done
+
+  warn "这会停止并删除所有容器"
+  [[ "$PURGE" == "true" ]] || warn "数据目录 $ROOT/data 会保留"
+
+  if [[ "$FORCE" != "true" ]] && ! ask_yn "  确认卸载？" "n"; then info "已取消"; return; fi
+
+  info "停止容器"
+  dc down --remove-orphans 2>/dev/null || true
+  info "删除镜像"
+  docker rmi "oc-stack/openchamber:$(envget OPENCHAMBER_VERSION)" 2>/dev/null || true
+
+  if [[ "$PURGE" == "true" ]]; then
+    warn "删除全部数据（不可恢复）"
+    if [[ "$FORCE" == "true" ]] || ask_yn "  真的要删 $ROOT/data 吗？" "n"; then
+      rm -rf "$ROOT/data" "$ROOT/workspaces"
+      docker volume rm oc-stack_caddy_data oc-stack_caddy_config 2>/dev/null || true
+      ok "数据已删除"
+    else
+      info "数据保留"
+    fi
+  else
+    ok "数据保留在 $ROOT/data"
+    info "彻底删除：./ocstack uninstall --purge"
+  fi
+}
+
+print_summary() {
+  local oc api pw
+  oc="$(envget OC_DOMAIN)"; api="$(envget API_DOMAIN)"
+  pw="$(envget OPENCHAMBER_UI_PASSWORD)"
+  local ip
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}' || true)"
+  ip="${ip:-<服务器IP>}"
+
+  printf '\n%s%s╭────────────────────────────────────────────────────────╮%s\n' "$B" "$GRN" "$R"
+  printf '%s%s│  安装完成                                              │%s\n' "$B" "$GRN" "$R"
+  printf '%s%s╰────────────────────────────────────────────────────────╯%s\n\n' "$B" "$GRN" "$R"
+
+  if [[ -n "$oc" ]]; then
+    printf '  %sOpenChamber%s  https://%s\n' "$B" "$R" "$oc"
+  else
+    printf '  %sOpenChamber%s  http://%s:8080\n' "$B" "$R" "$ip"
+  fi
+  printf '  %sUI 密码%s      %s\n' "$B" "$R" "$pw"
+  if [[ -n "$api" ]]; then
+    printf '\n  %sSub2API%s      https://%s\n' "$B" "$R" "$api"
+    printf '  %s管理员%s       %s\n' "$B" "$R" "$(envget ADMIN_EMAIL)"
+    printf '  %s密码%s         %s\n' "$B" "$R" "$(envget ADMIN_PASSWORD)"
+  else
+    printf '\n  %sSub2API%s      仅内部网络（不对外）\n' "$B" "$R"
+    printf '  %s管理员%s       %s / %s\n' "$B" "$R" "$(envget ADMIN_EMAIL)" "$(envget ADMIN_PASSWORD)"
+  fi
+
+  cat <<EOF
+
+  ${B}常用命令${R}
+    ./ocstack status          看状态
+    ./ocstack logs caddy      看证书申请过程
+    ./ocstack bootstrap       补配置上游（如果安装时跳过了）
+    ./ocstack verify          六层验证
+    ./ocstack upgrade         升级
+    ./ocstack uninstall       卸载
+
+  ${B}把代码放进去${R}
+    ${DIM}项目放在 ./workspaces/ 下，容器内路径是 /workspace${R}
+
+EOF
+}
+
+# =============================================================================
+# 入口
+# =============================================================================
+usage() {
+  sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  ASSUME_YES="false"
+  for a in "$@"; do [[ "$a" == "--yes" || "$a" == "-y" ]] && ASSUME_YES="true"; done
+
+  case "$cmd" in
+    install)    cmd_install "$@" ;;
+    bootstrap)  cmd_bootstrap "$@" ;;
+    verify)     cmd_verify ;;
+    up)         cmd_up "$@" ;;
+    down)       cmd_down ;;
+    restart)    cmd_restart ;;
+    status)     cmd_status ;;
+    logs)       cmd_logs "$@" ;;
+    cert)       cmd_cert ;;
+    upgrade)    cmd_upgrade "$@" ;;
+    uninstall)  cmd_uninstall "$@" ;;
+    ""|help|-h|--help) usage ;;
+    *) die "未知命令：$cmd（./ocstack help 查看）" ;;
+  esac
+}
+
+main "$@"
