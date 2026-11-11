@@ -22,6 +22,7 @@ CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
 CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
 CC_API_KEY="${CC_API_KEY:-}"
 PORT_CONFLICT_MODE="free"
+OCCUPIER_443=""
 IP_MODE_FORCED="false"
 CERT_MODE="caddy"
 OC_DOMAIN_ARG=""
@@ -337,6 +338,35 @@ $( [[ "$nonstandard_port" == "false" ]] && echo '		Strict-Transport-Security "ma
 EOF
       fi
 
+      # ---- IP 兜底入口（域名证书出问题时还能进）----
+      if [[ -n "$oc_dom" ]]; then
+        # 注意：http_port 指令只影响重定向，不会创建 site。
+        # 这里必须显式写 :端口 才会真的监听。
+        if [[ "$http_port" != "$caddy_http" ]]; then
+          cat <<EOF
+# ---- IP 兜底入口（HTTPS 证书出问题时用）----
+# 用 http://你的IP:${http_port} 访问，明文，仅供应急
+http://0.0.0.0:${http_port} {
+	encode gzip
+	handle {
+		reverse_proxy openchamber:3000 {
+			flush_interval -1
+			transport http {
+				read_timeout 3600s
+				write_timeout 3600s
+			}
+		}
+	}
+	header {
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}
+
+EOF
+        fi
+      fi
+
       if [[ -n "$api_dom" && "$gw_mode" == "local" ]]; then
         cat <<EOF
 # ---- Sub2API ----
@@ -423,10 +453,16 @@ cmd_install() {
   done
 
   if [[ -n "$port_in_use" ]]; then
-    # 提取占用者进程名（不用 sed 正则，直接 awk，避免转义地狱）
-    occupier="$(ss -tlnp 2>/dev/null | grep -E ':(80|443) ' \
+    # 分别提取 80 和 443 的占用者，判断逻辑要区分
+    local occupier80="" occupier443=""
+    occupier80="$(ss -tlnp 2>/dev/null | grep -E ':80 ' \
       | grep -o 'users:(("[^"]*"' | sed 's/users:((//; s/"//g' \
       | sort -u | paste -sd' ' - 2>/dev/null || true)"
+    occupier443="$(ss -tlnp 2>/dev/null | grep -E ':443 ' \
+      | grep -o 'users:(("[^"]*"' | sed 's/users:((//; s/"//g' \
+      | sort -u | paste -sd' ' - 2>/dev/null || true)"
+    occupier="$(printf '%s %s' "$occupier80" "$occupier443" | xargs -n1 2>/dev/null | sort -u | paste -sd' ' - 2>/dev/null || true)"
+    OCCUPIER_443="$occupier443"
 
     head1 "端口冲突"
     warn "80/443 已被占用：${port_in_use}"
@@ -458,9 +494,11 @@ EOM
     # --yes 时自动决策：443 被非 nginx/apache 类服务占用时，
     # 强行接管会失败（如 mmw-agent 这类），直接选 acme.sh
     local conflict_choice default_choice="1"
-    if [[ -n "$occupier" ]] && ! echo "$occupier" | grep -qE 'nginx|apache|httpd|caddy'; then
+    # 只看 443：如果占它不是 nginx/apache 这类能被接管的后端，
+    # 强行 stop 也没用（比如 mmw-agent 是独立进程），必须走 acme.sh
+    if [[ -n "$OCCUPIER_443" ]] && ! echo "$OCCUPIER_443" | grep -qE '^(nginx|apache2?|httpd|caddy)$'; then
       default_choice="2"
-      warn "443 被非 Web 服务占用（$occupier），自动选择 acme.sh 方案"
+      warn "443 被 ${OCCUPIER_443} 占用（非 nginx 类），自动选择 acme.sh 方案"
     fi
 
     ask conflict_choice "  选择" "$default_choice"
@@ -515,6 +553,7 @@ EOM
     esac
   else
     PORT_CONFLICT_MODE="free"
+OCCUPIER_443=""
     ok "80/443 可用"
   fi
 
@@ -673,17 +712,29 @@ EOF
   ok "Sub2API 管理员密码已生成"
   ok "数据库与 JWT 密钥已生成"
 
-  if [[ "$IP_MODE" == "true" ]]; then
-    # IP 模式：从 18080 起找空闲，绝不从 CADDY 端口派生（会得到 82、84 这种低位端口）
-    IP_HTTP_PORT="$(free_port 18080)"
-    IP_API_PORT="$(free_port $((IP_HTTP_PORT + 1)))"
-  else
-    IP_HTTP_PORT="$(free_port 18080)"
-    IP_API_PORT="$(free_port 18081)"
-  fi
+  # 端口优先复用 .env 里已有的值（重装不能改端口，否则反代/隧道全失效）。
+  # 只有首次安装、或原端口真的被外部占用时才重新探测。
+  local reused=""
+  port_or_free() {
+    local key="$1" fallback="$2" cur occupied_by_self
+    cur="$(envget "$key")"
+    if [[ -n "$cur" ]]; then
+      # 端口被自己容器占着是正常的，不算冲突
+      occupied_by_self="$(docker ps --format '{{.Ports}}' 2>/dev/null | grep -c ":${cur}->" || true)"
+      if (( occupied_by_self > 0 )) || ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${cur}$"; then
+        reused="true"
+        printf '%s' "$cur"
+        return
+      fi
+    fi
+    free_port "$fallback"
+  }
+
+  IP_HTTP_PORT="$(port_or_free HTTP_PORT 18080)"
+  IP_API_PORT="$(port_or_free API_HTTP_PORT 18081)"
   # Sub2API 始终绑 127.0.0.1，方便 SSH 隧道进后台（不暴露公网）
   local SUB2API_LOCAL_PORT
-  SUB2API_LOCAL_PORT="$(free_port $((IP_API_PORT + 1)))"
+  SUB2API_LOCAL_PORT="$(port_or_free SUB2API_LOCAL_PORT $((IP_API_PORT + 1)))"
 
   # ---- 4. 写配置 ----
   head1 "5/6 写入配置"
@@ -804,7 +855,13 @@ EOF
 
   # ---- 5. 构建启动 ----
   head1 "6/6 构建并启动"
-  write_caddyfile "$OC_DOMAIN" "$API_DOMAIN" "$ACME_EMAIL" "$IP_MODE" "$IP_HTTP_PORT" "$IP_API_PORT" "$GATEWAY_MODE" "$CERT_MODE" "/etc/oc-certs" "$CADDY_HTTP_PORT" "$CADDY_HTTPS_PORT"
+  # 必须用 .env 里实际落地的端口，否则重装时 Caddyfile 会和端口映射错位
+  local FINAL_HTTP_PORT FINAL_API_PORT
+  FINAL_HTTP_PORT="$(envget HTTP_PORT)"; FINAL_HTTP_PORT="${FINAL_HTTP_PORT:-$IP_HTTP_PORT}"
+  FINAL_API_PORT="$(envget API_HTTP_PORT)"; FINAL_API_PORT="${FINAL_API_PORT:-$IP_API_PORT}"
+  write_caddyfile "$OC_DOMAIN" "$API_DOMAIN" "$ACME_EMAIL" "$IP_MODE" \
+    "$FINAL_HTTP_PORT" "$FINAL_API_PORT" "$GATEWAY_MODE" "$CERT_MODE" "/etc/oc-certs" \
+    "$(envget CADDY_HTTP_PORT)" "$(envget CADDY_HTTPS_PORT)"
 
   # ---- acme.sh 外部证书：必须在 Caddy 启动前签好，否则 Caddy 起不来 ----
   local ACME_HELPER="$ROOT/scripts/acme-helper.sh"

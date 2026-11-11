@@ -7,8 +7,17 @@
 # =============================================================================
 set -uo pipefail
 
-OCSTACK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 解析符号链接的真实路径：oc 会被软链到 /usr/local/bin/oc，
+# 用 BASH_SOURCE 直接取会拿到 /usr/local/bin，读不到 .env
+_self="${BASH_SOURCE[0]}"
+while [[ -L "$_self" ]]; do
+  _dir="$(cd -P "$(dirname "$_self")" && pwd)"
+  _self="$(readlink "$_self")"
+  [[ "$_self" != /* ]] && _self="$_dir/$_self"
+done
+OCSTACK="$(cd -P "$(dirname "$_self")" && pwd)"
 cd "$OCSTACK" || exit 1
+unset _self _dir
 
 # ---- 颜色 -------------------------------------------------------------------
 if [[ -t 1 ]]; then
@@ -68,37 +77,86 @@ act_verify() {
 
 act_urls() {
   echo
-  local oc api https_port
-  oc="$(envget OC_DOMAIN)"; api="$(envget API_DOMAIN)"
-  https_port="$(envget CADDY_HTTPS_PORT)"; https_port="${https_port:-443}"
-  local ip
-  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')"
-  ip="${ip:-<IP>}"
 
-  printf '%s可用地址%s\n\n' "$B" "$R"
-  if [[ -n "$oc" ]]; then
-    if [[ "$https_port" == "443" ]] || [[ -f /usr/local/nginx/servers/oc-stack-chamber.conf ]]; then
-      printf '  %sOpenChamber%s  %shttps://%s%s\n' "$B" "$R" "$GRN" "$oc" "$R"
-    else
-      printf '  %sOpenChamber%s  %shttps://%s:%s%s\n' "$B" "$R" "$GRN" "$oc" "$https_port" "$R"
-      printf '  %s              也可用 http://%s:%s%s\n' "$DIM" "$ip" "$(envget HTTP_PORT)" "$R"
-    fi
-  else
-    printf '  %sOpenChamber%s  %shttp://%s:%s%s\n' "$B" "$R" "$GRN" "$ip" "$(envget HTTP_PORT)" "$R"
+  if [[ ! -f .env ]]; then
+    printf '  %s没有找到 .env，请先安装：./ocstack install%s\n' "$RED" "$R"
+    return 1
   fi
 
-  if [[ -n "$api" ]]; then
-    if [[ "$https_port" == "443" ]] || [[ -f /usr/local/nginx/servers/oc-stack-sub2api.conf ]]; then
-      printf '  %sSub2API%s      %shttps://%s%s\n' "$B" "$R" "$GRN" "$api" "$R"
+  local oc api https_port http_port sub_port gw_mode
+  oc="$(envget OC_DOMAIN)"
+  api="$(envget API_DOMAIN)"
+  https_port="$(envget CADDY_HTTPS_PORT)"; https_port="${https_port:-443}"
+  http_port="$(envget HTTP_PORT)"; http_port="${http_port:-18080}"
+  sub_port="$(envget SUB2API_LOCAL_PORT)"; sub_port="${sub_port:-18082}"
+  gw_mode="$(envget GATEWAY_MODE)"; gw_mode="${gw_mode:-local}"
+
+  local ip
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')"
+  ip="${ip:-<服务器IP>}"
+
+  local nginx_oc=false nginx_api=false
+  [[ -f /usr/local/nginx/servers/oc-stack-chamber.conf ]] && nginx_oc=true
+  [[ -f /usr/local/nginx/servers/oc-stack-sub2api.conf ]] && nginx_api=true
+
+  # 探测 IP 直连是否真的可用（有监听不等于能响应）
+  probe() {
+    local url="$1"
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' -m 4 "$url" 2>/dev/null)"
+    [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && printf '%s' "$code" || printf ''
+  }
+
+  # ---- OpenChamber ----
+  printf '%s【OpenChamber】%s  —— 平时用这个\n' "$B" "$R"
+  local oc_main="" oc_alt=""
+  if [[ -n "$oc" ]]; then
+    if [[ "$nginx_oc" == "true" || "$https_port" == "443" ]]; then
+      oc_main="https://$oc"
     else
-      printf '  %sSub2API%s      %shttps://%s:%s%s\n' "$B" "$R" "$GRN" "$api" "$https_port" "$R"
+      oc_main="https://$oc:$https_port"
     fi
+    printf '   地址    %s%s%s\n' "$GRN" "$oc_main" "$R"
+
+    # IP 备用：逐个探测，只显示通的
+    local c
+    c="$(probe "http://$ip:$http_port/")"
+    if [[ -n "$c" ]]; then
+      printf '   备用    %shttp://%s:%s%s\n' "$DIM" "$ip" "$http_port" "$R"
+    fi
+  else
+    # 未配域名：只有 IP
+    oc_main="http://$ip:$http_port"
+    printf '   地址    %s%s%s\n' "$GRN" "$oc_main" "$R"
+    printf '   %s未配置域名，仅 IP + HTTP 访问（明文）%s\n' "$DIM" "$R"
+  fi
+  printf '   密码    %s%s%s\n' "$B" "$(envget OPENCHAMBER_UI_PASSWORD)" "$R"
+
+  # ---- Sub2API ----
+  if [[ "$gw_mode" == "external" ]]; then
+    printf '\n%s【网关】%s  外接已有 Sub2API，未在本机部署\n' "$B" "$R"
+    printf '   地址    %s%s%s\n' "$GRN" "$(envget SUB2API_BASE_URL)" "$R"
+    printf '   %s密钥请在原网关后台创建%s\n' "$DIM" "$R"
+  else
+    printf '\n%s【Sub2API 后台】%s  —— 填上游地址和 Key 的地方\n' "$B" "$R"
+    if [[ -n "$api" ]]; then
+      if [[ "$nginx_api" == "true" || "$https_port" == "443" ]]; then
+        printf '   地址    %shttps://%s%s\n' "$GRN" "$api" "$R"
+      else
+        printf '   地址    %shttps://%s:%s%s\n' "$GRN" "$api" "$https_port" "$R"
+      fi
+      printf '   备用    %shttp://127.0.0.1:%s%s  （仅本机，需 SSH 隧道）\n' "$DIM" "$sub_port" "$R"
+      printf '   %s        ssh -L %s:127.0.0.1:%s root@%s%s\n' "$DIM" "$sub_port" "$sub_port" "$ip" "$R"
+    else
+      printf '   地址    %shttp://127.0.0.1:%s%s  （仅本机，需 SSH 隧道）\n' "$GRN" "$sub_port" "$R"
+      printf '   %s        ssh -L %s:127.0.0.1:%s root@%s%s\n' "$DIM" "$sub_port" "$sub_port" "$ip" "$R"
+    fi
+    printf '   账号    %s%s%s\n' "$B" "$(envget ADMIN_EMAIL)" "$R"
+    printf '   密码    %s%s%s\n' "$B" "$(envget ADMIN_PASSWORD)" "$R"
   fi
 
   echo
-  printf '%s登录凭据%s\n\n' "$B" "$R"
-  printf '  OpenChamber  %s\n' "$(envget OPENCHAMBER_UI_PASSWORD)"
-  printf '  Sub2API      %s / %s\n' "$(envget ADMIN_EMAIL)" "$(envget ADMIN_PASSWORD)"
+  printf '%s域名打不开时，用「备用」那个 IP 地址先顶上，再排查证书。%s\n' "$DIM" "$R"
 }
 
 # ---- 443 端口共享 -----------------------------------------------------------
@@ -229,6 +287,129 @@ act_logs()    {
 act_bootstrap(){ echo; ./ocstack bootstrap; }
 act_restart() { echo; ./ocstack restart; printf '%s  已重启%s\n' "$GRN" "$R"; }
 act_upgrade() { echo; ./ocstack upgrade; }
+# ---- 修改密码 ---------------------------------------------------------------
+act_passwd() {
+  echo
+  printf '%s修改密码%s\n\n' "$B" "$R"
+  printf '  [1] OpenChamber 登录密码\n'
+  printf '  [2] Sub2API 管理员密码\n'
+  printf '  [3] 两个都改\n'
+  printf '  [0] 返回\n\n'
+  printf '  选择 [0]: '
+  local c; read -r c || c=0
+  [[ "$c" == "0" || -z "$c" ]] && return 0
+
+  local do_oc=false do_api=false
+  case "$c" in
+    1) do_oc=true ;;
+    2) do_api=true ;;
+    3) do_oc=true; do_api=true ;;
+    *) printf '  无效选择\n'; return 1 ;;
+  esac
+
+  echo
+
+  # ---- OpenChamber ----
+  if [[ "$do_oc" == "true" ]]; then
+    printf '  新 OpenChamber 密码（回车自动生成）: '
+    local newpw; read -r newpw || newpw=""
+    if [[ -z "$newpw" ]]; then
+      newpw="$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-20)"
+      printf '  %s已自动生成%s\n' "$DIM" "$R"
+    fi
+    if (( ${#newpw} < 8 )); then
+      printf '  %s密码太短（至少 8 位），已取消%s\n' "$RED" "$R"
+    else
+      setenv OPENCHAMBER_UI_PASSWORD "$newpw"
+      printf '  %sOpenChamber 密码已更新%s，正在重启容器...\n' "$GRN" "$R"
+      docker compose --env-file .env -f docker-compose.yml --profile local-gw \
+        up -d --force-recreate openchamber >/dev/null 2>&1 || \
+        docker restart oc-openchamber >/dev/null 2>&1
+      sleep 3
+      printf '  %s新密码：%s%s\n' "$B" "$newpw" "$R"
+    fi
+    echo
+  fi
+
+  # ---- Sub2API ----
+  if [[ "$do_api" == "true" ]]; then
+    if [[ "$(envget GATEWAY_MODE)" == "external" ]]; then
+      printf '  %s当前是外接网关模式，本机没有 Sub2API，请到原网关后台改密码。%s\n' "$YEL" "$R"
+    else
+      printf '  新 Sub2API 管理员密码（回车自动生成，至少 8 位）: '
+      local newpw; read -r newpw || newpw=""
+      if [[ -z "$newpw" ]]; then
+        newpw="$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-20)"
+        printf '  %s已自动生成%s\n' "$DIM" "$R"
+      fi
+      if (( ${#newpw} < 8 )); then
+        printf '  %s密码太短（至少 8 位），已取消%s\n' "$RED" "$R"
+      else
+        # Sub2API 的密码存在数据库里，改 .env 不够，必须调接口改
+        # Sub2API 绑在 SUB2API_LOCAL_PORT（默认 18082），
+        # 不是 API_HTTP_PORT（那个是 Caddy 的 HTTP 入口）
+        local api_port gw email oldpw
+        api_port="$(envget SUB2API_LOCAL_PORT)"; api_port="${api_port:-18082}"
+        gw="http://127.0.0.1:${api_port}"
+        email="$(envget ADMIN_EMAIL)"
+        oldpw="$(envget ADMIN_PASSWORD)"
+
+        printf '  正在通过管理接口修改...\n'
+        local token
+        token="$(curl -sS -m 15 -X POST "$gw/api/v1/auth/login" \
+          -H 'Content-Type: application/json' \
+          -d "$(python3 -c "import json,sys;print(json.dumps({'email':sys.argv[1],'password':sys.argv[2]}))" "$email" "$oldpw")" 2>/dev/null \
+          | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('data',{}).get('access_token',''))" 2>/dev/null || true)"
+
+        if [[ -z "$token" ]]; then
+          printf '  %s登录失败，无法通过接口改密码%s\n' "$RED" "$R"
+          printf '  %s原因可能是 .env 里的旧密码和数据库不一致%s\n' "$YEL" "$R"
+          printf '  %s手动改：先登录后台，账号设置里修改%s\n' "$DIM" "$R"
+        else
+          local resp
+          resp="$(curl -sS -m 20 -X PUT "$gw/api/v1/admin/users/1" \
+            -H "Authorization: Bearer $token" \
+            -H 'Content-Type: application/json' \
+            -d "$(python3 -c "import json,sys;print(json.dumps({'password':sys.argv[1]}))" "$newpw")" 2>/dev/null || true)"
+
+          if echo "$resp" | grep -q '"code":0'; then
+            setenv ADMIN_PASSWORD "$newpw"
+            printf '  %sSub2API 密码已更新%s\n' "$GRN" "$R"
+            printf '  %s新密码：%s%s\n' "$B" "$newpw" "$R"
+          else
+            printf '  %s接口返回：%s%s\n' "$YEL" "$(echo "$resp" | head -c 150)" "$R"
+            printf '  %s请到后台手动修改%s\n' "$DIM" "$R"
+          fi
+        fi
+      fi
+    fi
+    echo
+  fi
+
+  printf '  %s密码已写入 .env，记得同步更新你的密码管理器。%s\n' "$DIM" "$R"
+}
+
+# 安全地写 .env 中的某个键
+setenv() {
+  local k="$1" v="$2"
+  if grep -qE "^${k}=" .env 2>/dev/null; then
+    python3 - .env "$k" "$v" <<'PY'
+import sys
+path, k, v = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(path).read().splitlines()
+out = []
+for line in lines:
+    if line.startswith(k + "="):
+        out.append(f"{k}={v}")
+    else:
+        out.append(line)
+open(path, "w").write("\n".join(out) + "\n")
+PY
+  else
+    printf '%s=%s\n' "$k" "$v" >> .env
+  fi
+}
+
 act_backup() {
   echo
   local f="/root/oc-stack-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
@@ -279,8 +460,9 @@ menu() {
     printf '  %s9%s  重启容器\n'                                  "$DIM" "$R"
     printf '  %s10%s 升级版本\n'                                   "$DIM" "$R"
     printf '  %s11%s 备份数据          %s打包 .env + data%s\n'     "$DIM" "$R" "$DIM" "$R"
-    printf '  %s12%s 开机自启\n'                                   "$DIM" "$R"
-    printf '  %s13%s 卸载\n'                                       "$RED" "$R"
+    printf '  %s12%s 修改密码          %sOpenChamber / Sub2API%s\n'  "$MAG" "$R" "$DIM" "$R"
+    printf '  %s13%s 开机自启\n'                                   "$DIM" "$R"
+    printf '  %s14%s 卸载\n'                                       "$RED" "$R"
     echo
     printf '  %s0%s  退出\n'                                       "$DIM" "$R"
     echo
@@ -299,8 +481,9 @@ menu() {
       9) act_restart ;;
       10) act_upgrade ;;
       11) act_backup ;;
-      12) act_autostart ;;
-      13) act_uninstall ;;
+      12) act_passwd ;;
+      13) act_autostart ;;
+      14) act_uninstall ;;
       0|q|Q) exit 0 ;;
       *) printf '  %s无效编号%s\n' "$RED" "$R" ;;
     esac
@@ -323,6 +506,7 @@ case "${1:-}" in
   bootstrap) act_bootstrap ;;
   restart)   act_restart ;;
   upgrade)   act_upgrade ;;
+  passwd)    act_passwd ;;
   backup)    act_backup ;;
   autostart) act_autostart ;;
   uninstall) act_uninstall ;;
@@ -341,6 +525,7 @@ oc —— oc-stack 控制台
   oc bootstrap      配置上游
   oc restart        重启
   oc upgrade        升级
+  oc passwd         修改密码
   oc backup         备份数据
   oc autostart      开机自启
   oc uninstall      卸载
