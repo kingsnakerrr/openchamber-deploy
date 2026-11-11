@@ -34,6 +34,36 @@ bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/openchamber-deplo
 
 全部自动探测空闲端口，冲突了就往下挪。
 
+**HTTPS 用的是高位端口时，访问地址要带端口号**，例如 `https://oc.example.com:18200`。装完会直接打印完整地址。
+
+## 80/443 被占用怎么办
+
+安装时会检测并让你选：
+
+| 选项 | 适用 | 结果 |
+|---|---|---|
+| **1. 停掉占用者** | 那台机器上没别的网站 | 自动停用 nginx，Caddy 接管 80/443，URL 不带端口 |
+| **2. 用 acme.sh 签证书** | 你要保留现有 nginx 或别的程序占着 443 | acme.sh 临时借 80 几秒签证书，Caddy 跑在高位端口，URL 带端口 |
+| **3. 不上 HTTPS** | 临时试用 | IP + HTTP 明文 |
+| **4. 只生成反代配置** | 你自己懂 nginx | 生成配置片段给你，自己套用 |
+
+选项 2 的工作方式：
+
+```
+acme.sh --issue --standalone -d 你的域名
+   ↓ 临时停 nginx 几秒，独占 80 完成校验
+   ↓ 签完立刻把 nginx 拉回来（并还原开机自启）
+证书存到 /etc/oc-certs/<域名>/
+   ↓
+Caddy 用 tls 指令加载这些证书，监听高位端口
+   ↓
+你访问 https://你的域名:18200
+```
+
+续期由 acme.sh 的 cron 每天 03:17 检查，到期前 30 天自动续，续期时的 `--pre-hook` / `--post-hook` 会自动让出并归还 80 端口。**不需要 certbot。**
+
+邮箱可以不填——证书照样签发，只是收不到到期提醒。
+
 ## 两种网关模式
 
 ### 本地部署（默认，推荐）
@@ -115,6 +145,7 @@ ssh -L 18104:127.0.0.1:18104 root@服务器
 ./ocstack uninstall --purge  连数据删
 ./ocstack bootstrap          补配置网关
 ./ocstack logs caddy         证书日志
+./ocstack cert               证书有效期与剩余天数
 ```
 
 ## 开机自启

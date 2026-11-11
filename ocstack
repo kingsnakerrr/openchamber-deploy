@@ -23,6 +23,7 @@ CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
 CC_API_KEY="${CC_API_KEY:-}"
 PORT_CONFLICT_MODE="free"
 IP_MODE_FORCED="false"
+CERT_MODE="caddy"
 OC_DOMAIN_ARG=""
 API_DOMAIN_ARG=""
 EMAIL_ARG=""
@@ -232,34 +233,47 @@ ask_yn() {
 # Caddyfile 生成
 # =============================================================================
 write_caddyfile() {
-  local oc_dom="$1" api_dom="$2" email="$3" ip_mode="$4" http_port="${5:-18080}" api_port="${6:-18081}"
-  # 外接网关时本地没有 sub2api 容器，不能生成指向它的反代
+  local oc_dom="$1" api_dom="$2" email="$3" ip_mode="$4"
+  local http_port="${5:-18080}" api_port="${6:-18081}"
   local gw_mode="${7:-local}"
+  local cert_mode="${8:-caddy}"
+  local cert_root="${9:-/etc/oc-certs}"
+  # 公网 HTTPS 端口。80/443 被占用时用高位端口，URL 里要带端口号
+  local caddy_http="${10:-80}" caddy_https="${11:-443}"
 
   mkdir -p "$CADDY_DIR"
   [[ -f "$CADDY_FILE" ]] && cp "$CADDY_FILE" "$CADDY_FILE.bak.$(date +%s)"
+
+  # 外部证书：每个域名各自的证书路径（容器内挂载在 /certs）
+  tls_block() {
+    local dom="$1"
+    [[ "$cert_mode" != "acme" ]] && return 0
+    [[ -z "$dom" ]] && return 0
+    printf '\ttls /certs/%s/fullchain.pem /certs/%s/key.pem\n' "$dom" "$dom"
+  }
+
+  local nonstandard_port="false"
+  [[ "$caddy_https" != "443" ]] && nonstandard_port="true"
 
   {
     cat <<EOF
 # 由 ocstack 自动生成 — $(date -Iseconds)
 # 不要直接改这个文件，改 .env 后运行 ./ocstack install 重新生成
 {
-	email ${email:-admin@example.com}
+$( [[ -n "$email" ]] && printf '\temail %s\n' "$email" )
 	admin off
+$( [[ "$caddy_http" != "80" ]] && printf '\thttp_port %s\n' "$caddy_http" )
+$( [[ "$caddy_https" != "443" ]] && printf '\thttps_port %s\n' "$caddy_https" )
 }
 
 EOF
 
     if [[ "$ip_mode" == "true" ]]; then
-      # 无域名：纯 HTTP。Let's Encrypt 不支持纯 IP 证书，只能退化成明文。
-      # 单端口 + 路径前缀区分两个服务。
       cat <<EOF
 # IP 模式：无 HTTPS（Let's Encrypt 不为纯 IP 签证书）
-# 这个模式仅适合临时试用，尽快配域名切到 HTTPS
 :${http_port} {
 	encode gzip
 
-	# OpenChamber 走根路径
 	handle {
 		reverse_proxy openchamber:3000 {
 			flush_interval -1
@@ -277,10 +291,8 @@ EOF
 }
 
 EOF
-      # 只有本地部署网关时才生成 Sub2API 入口
       if [[ "$gw_mode" == "local" ]]; then
         cat <<EOF
-# Sub2API 单独一个端口，方便客户端填 baseURL
 :${api_port} {
 	encode gzip
 	reverse_proxy sub2api:8080 {
@@ -298,15 +310,14 @@ EOF
 EOF
       fi
     else
-      # 域名模式：自动 HTTPS + 自动续期（Caddy 内置 ACME）
       if [[ -n "$oc_dom" ]]; then
         cat <<EOF
 # ---- OpenChamber ----
 ${oc_dom} {
+$(tls_block "$oc_dom")
 	encode gzip zstd
 
 	reverse_proxy openchamber:3000 {
-		# SSE 必须立即 flush，否则界面发消息转圈
 		flush_interval -1
 		transport http {
 			read_timeout 3600s
@@ -315,27 +326,24 @@ ${oc_dom} {
 	}
 
 	header {
-		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+$( [[ "$nonstandard_port" == "false" ]] && echo '		Strict-Transport-Security "max-age=31536000; includeSubDomains"' )
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "SAMEORIGIN"
 		Referrer-Policy "strict-origin-when-cross-origin"
 		-Server
 	}
-
-	# 证书过期前 30 天自动续期由 Caddy 处理，无需 cron
 }
 
 EOF
       fi
 
-      if [[ -n "$api_dom" ]]; then
+      if [[ -n "$api_dom" && "$gw_mode" == "local" ]]; then
         cat <<EOF
 # ---- Sub2API ----
 ${api_dom} {
+$(tls_block "$api_dom")
 	encode gzip zstd
 
-	# 粘性会话依赖 session_id 这个带下划线的头，
-	# Caddy 默认原样透传（Nginx 需要 underscores_in_headers on）
 	reverse_proxy sub2api:8080 {
 		flush_interval -1
 		transport http {
@@ -345,7 +353,7 @@ ${api_dom} {
 	}
 
 	header {
-		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+$( [[ "$nonstandard_port" == "false" ]] && echo '		Strict-Transport-Security "max-age=31536000; includeSubDomains"' )
 		X-Content-Type-Options "nosniff"
 		-Server
 	}
@@ -356,10 +364,22 @@ EOF
     fi
   } > "$CADDY_FILE"
 
-  docker run --rm -v "$CADDY_FILE:/etc/caddy/Caddyfile:ro" caddy:2-alpine \
-    caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
-    && ok "Caddyfile 语法校验通过" \
-    || warn "Caddyfile 校验未通过，检查 $CADDY_FILE"
+  # 校验语法。acme 模式下证书还没生成时 Caddy 会报找不到文件，
+  # 这不算语法错误，单独放行。
+  local vout
+  vout="$(docker run --rm \
+    -v "$CADDY_FILE:/etc/caddy/Caddyfile:ro" \
+    -v "${cert_root}:/certs:ro" \
+    "caddy:${CADDY_VERSION:-2.11}" \
+    caddy validate --config /etc/caddy/Caddyfile 2>&1 || true)"
+  if echo "$vout" | grep -q "Valid configuration"; then
+    ok "Caddyfile 语法校验通过"
+  elif echo "$vout" | grep -q "no such file or directory" && echo "$vout" | grep -q "/certs/"; then
+    ok "Caddyfile 语法校验通过（证书待签发）"
+  else
+    warn "Caddyfile 校验未通过，检查 $CADDY_FILE"
+    echo "$vout" | grep -i error | tail -3 | sed 's/^/     /'
+  fi
 }
 
 # =============================================================================
@@ -414,36 +434,62 @@ cmd_install() {
 
     cat <<'EOM'
 
-  HTTPS 证书需要 80 端口做校验（Let's Encrypt 只会访问域名的 80）。
-  80 被别的服务占着，Caddy 就拿不到证书，域名必然打不开。
+  原因：Caddy 自己申请证书时，Let's Encrypt 会访问域名的 80 端口做校验。
+  80 被别的服务占着，Caddy 就永远拿不到证书，域名必然打不开。
 
-  三个选择：
+  四个选择：
 
-    [1] 停掉占用者，让 Caddy 接管 80/443   —— 最干净，HTTPS 直接可用
-    [2] 保留 nginx，我生成反代配置           —— 你手动套用，需要懂 nginx
-    [3] 不上 HTTPS，只用 IP + HTTP           —— 最快能用，但明文不安全
+    [1] 停掉占用者，让 Caddy 接管 80/443
+        最简单，HTTPS 直接可用。会停止并禁用 nginx 等占用服务。
+
+    [2] 用 acme.sh 单独签证书，保留现有 nginx  ← 推荐用于你这种情况
+        acme.sh 临时借 80 端口签证书（几秒），签完立刻还给 nginx。
+        Caddy 只在内网端口跑，由你的 nginx 反代过来。
+        443 被别的程序占用时需要那个程序能转发 HTTP。
+
+    [3] 不上 HTTPS，只用 IP + HTTP
+        最快能用，但密码明文传输，只适合内网/临时测试。
+
+    [4] 让我只生成反代配置，其他都不动
+        你懂 nginx，自己套用。
 
 EOM
 
-    local conflict_choice
-    ask conflict_choice "  选择" "1"
+    # --yes 时自动决策：443 被非 nginx/apache 类服务占用时，
+    # 强行接管会失败（如 mmw-agent 这类），直接选 acme.sh
+    local conflict_choice default_choice="1"
+    if [[ -n "$occupier" ]] && ! echo "$occupier" | grep -qE 'nginx|apache|httpd|caddy'; then
+      default_choice="2"
+      warn "443 被非 Web 服务占用（$occupier），自动选择 acme.sh 方案"
+    fi
+
+    ask conflict_choice "  选择" "$default_choice"
 
     case "$conflict_choice" in
       2)
-        PORT_CONFLICT_MODE="proxy"
+        PORT_CONFLICT_MODE="acme"
+        CERT_MODE="acme"
+        # HTTP 和 HTTPS 必须是两个不同端口：
+        # acme.sh 用 80 签证书，Caddy 只需监听一个高位 HTTPS 端口给用户访问。
+        # 但 Caddy 仍需要一个 HTTP 端口做重定向，两者不能相同。
         CADDY_HTTP_PORT="$(free_port 18100)"
         CADDY_HTTPS_PORT="$(free_port $((CADDY_HTTP_PORT + 100)))"
-        warn "Caddy 内部监听 ${CADDY_HTTP_PORT}/${CADDY_HTTPS_PORT}，公网由你的 nginx 转发"
+        ok "acme.sh 签发证书；公网访问端口 ${CADDY_HTTPS_PORT}"
         ;;
       3)
         PORT_CONFLICT_MODE="none"
         IP_MODE_FORCED="true"
-        # IP 模式下 Caddy 不监听 80/443，端口从高位段开始分配
+        CERT_MODE="none"
         CADDY_HTTP_PORT="$(free_port 18100)"
         CADDY_HTTPS_PORT="$(free_port $((CADDY_HTTP_PORT + 100)))"
-        # 标记：端口计算不能从 CADDY_HTTP_PORT 派生
-        IP_PORTS_BASE="18100"
         warn "跳过 HTTPS，将用 IP + HTTP 访问"
+        ;;
+      4)
+        PORT_CONFLICT_MODE="proxy"
+        CERT_MODE="acme"
+        CADDY_HTTP_PORT="$(free_port 18100)"
+        CADDY_HTTPS_PORT="$(free_port $((CADDY_HTTP_PORT + 100)))"
+        warn "Caddy 内部监听 ${CADDY_HTTP_PORT}/${CADDY_HTTPS_PORT}，稍后生成反代配置给你"
         ;;
       *)
         PORT_CONFLICT_MODE="takeover"
@@ -458,7 +504,6 @@ EOM
             ok "$svc 已停止"
           fi
         done
-        # 停完再验一次
         sleep 1
         for p in 80 443; do
           if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$"; then
@@ -578,8 +623,13 @@ EOF
       if [[ "$GATEWAY_MODE" == "local" ]]; then
         ask API_DOMAIN "  Sub2API 域名（可回车跳过，之后走 SSH 隧道进后台）" "$API_DOMAIN"
       fi
-      ask ACME_EMAIL "  证书通知邮箱" "$ACME_EMAIL"
-      [[ "$ACME_EMAIL" == *@* ]] || die "邮箱格式不对：$ACME_EMAIL"
+      # 邮箱可选：不填就用占位地址，证书照样能签（只是收不到到期提醒）
+      ask ACME_EMAIL "  证书通知邮箱（可回车跳过）" "$ACME_EMAIL"
+      if [[ -n "$ACME_EMAIL" && "$ACME_EMAIL" != *@* ]]; then
+        warn "邮箱格式看起来不对，将忽略"
+        ACME_EMAIL=""
+      fi
+      [[ -z "$ACME_EMAIL" ]] && ok "未填邮箱，将不接收证书到期提醒（不影响签发）"
     fi
   fi
 
@@ -703,6 +753,8 @@ EOF
     echo "API_DOMAIN=${API_DOMAIN}"
     echo "ACME_EMAIL=${ACME_EMAIL}"
     echo "IP_MODE=${IP_MODE}"
+    echo "# 证书来源：caddy（Caddy 自己申请）/ acme（acme.sh 外部签发）/ none（无 HTTPS）"
+    echo "CERT_MODE=${CERT_MODE}"
     echo
     echo "# ---- 版本（升级时改这里）----"
     echo "OPENCODE_VERSION=${V_OPENCODE_VERSION}"
@@ -752,7 +804,27 @@ EOF
 
   # ---- 5. 构建启动 ----
   head1 "6/6 构建并启动"
-  write_caddyfile "$OC_DOMAIN" "$API_DOMAIN" "$ACME_EMAIL" "$IP_MODE" "$IP_HTTP_PORT" "$IP_API_PORT" "$GATEWAY_MODE"
+  write_caddyfile "$OC_DOMAIN" "$API_DOMAIN" "$ACME_EMAIL" "$IP_MODE" "$IP_HTTP_PORT" "$IP_API_PORT" "$GATEWAY_MODE" "$CERT_MODE" "/etc/oc-certs" "$CADDY_HTTP_PORT" "$CADDY_HTTPS_PORT"
+
+  # ---- acme.sh 外部证书：必须在 Caddy 启动前签好，否则 Caddy 起不来 ----
+  local ACME_HELPER="$ROOT/scripts/acme-helper.sh"
+  if [[ "$CERT_MODE" == "acme" && "$IP_MODE" != "true" ]]; then
+    [[ -x "$ACME_HELPER" ]] || chmod +x "$ACME_HELPER" 2>/dev/null || true
+    if [[ -f "$ACME_HELPER" ]]; then
+      head1 "申请证书（acme.sh）"
+      for d in $OC_DOMAIN $API_DOMAIN; do
+        [[ -z "$d" ]] && continue
+        if "$ACME_HELPER" issue "$d" "$ACME_EMAIL"; then
+          ok "$d 证书就绪"
+        else
+          warn "$d 证书申请失败，该域名将无法使用 HTTPS"
+        fi
+      done
+    else
+      warn "缺少 $ACME_HELPER，跳过外部证书申请"
+      CERT_MODE="caddy"
+    fi
+  fi
 
   info "构建 OpenChamber 镜像（首次 3-5 分钟）"
   dc build openchamber 2>&1 | tail -2
@@ -786,12 +858,41 @@ EOF
   local TLS_OK="false"
   if [[ "$IP_MODE" != "true" && -n "$OC_DOMAIN" ]]; then
     head1 "验证 HTTPS"
-    if wait_certificate "$OC_DOMAIN"; then
-      TLS_OK="true"
-      ok "https://$OC_DOMAIN 可以正常访问"
+    if [[ "$CERT_MODE" == "acme" ]]; then
+      # acme 模式：证书已签好，验证 Caddy 是否加载并能响应 TLS
+      if verify_internal_tls "$OC_DOMAIN" "$CADDY_HTTPS_PORT"; then
+        TLS_OK="true"
+        ok "Caddy 已加载证书，公网地址 https://${OC_DOMAIN}:${CADDY_HTTPS_PORT}"
+      else
+        TLS_OK="false"
+        warn "Caddy 未能加载证书，检查 ./ocstack logs caddy"
+      fi
     else
-      TLS_OK="false"
-      warn "证书申请失败，https://$OC_DOMAIN 打不开"
+      if wait_certificate "$OC_DOMAIN"; then
+        TLS_OK="true"
+        ok "https://$OC_DOMAIN 可以正常访问"
+      else
+        TLS_OK="false"
+        warn "证书申请失败，https://$OC_DOMAIN 打不开"
+      fi
+    fi
+  fi
+
+  # ---- 兜底：确保没把用户原有的 Web 服务弄挂 ----
+  if [[ "$CERT_MODE" == "acme" || "$PORT_CONFLICT_MODE" == "acme" ]]; then
+    if [[ -f /etc/oc-certs/.was-enabled ]]; then
+      while read -r svc; do
+        [[ -z "$svc" ]] && continue
+        info "恢复 $svc 的开机自启"
+        systemctl enable "$svc" >/dev/null 2>&1 || true
+        systemctl start "$svc" >/dev/null 2>&1 || true
+      done < /etc/oc-certs/.was-enabled
+      rm -f /etc/oc-certs/.was-enabled
+      ok "原有 Web 服务已恢复"
+    fi
+    # 80 端口有没有服务在监听（原本就该有）
+    if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE '[:.]80$'; then
+      warn "80 端口当前没有服务监听。如果你原本用 nginx，请确认：systemctl status nginx"
     fi
   fi
 
@@ -807,6 +908,72 @@ EOF
   fi
 
   print_summary "$TLS_OK"
+}
+
+# ---------------------------------------------------------------------------
+# 验证 Caddy 内网端口是否已加载证书
+# ---------------------------------------------------------------------------
+verify_internal_tls() {
+  local domain="$1" port="$2"
+  local i out
+  for i in $(seq 1 20); do
+    out="$(echo | timeout 8 openssl s_client -connect "127.0.0.1:${port}" \
+             -servername "$domain" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || true)"
+    if [[ "$out" == *"CN"* || "$out" == *"$domain"* ]]; then
+      printf '    %s%s%s\n' "$DIM" "$(echo "$out" | tr -d '\n')" "$R"
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# 打印反代配置片段（acme / proxy 模式必须让现有 nginx 转发过来）
+# ---------------------------------------------------------------------------
+print_proxy_snippet() {
+  local oc="$1" api="$2" http_port="$3" https_port="$4"
+  local f="$ROOT/nginx-oc-stack.conf"
+
+  {
+    echo "# oc-stack 反代配置 — $(date -Iseconds)"
+    echo "# 复制到你的 nginx 配置目录，例如 /usr/local/nginx/conf/ 或 /etc/nginx/conf.d/"
+    echo "# 然后：nginx -t && nginx -s reload"
+    echo
+    for pair in "$oc:$http_port" "$api:$http_port"; do
+      local dom="${pair%%:*}" port="${pair##*:}"
+      [[ -z "$dom" ]] && continue
+      cat <<EOF
+server {
+    listen 443 ssl http2;
+    server_name ${dom};
+
+    ssl_certificate     /etc/oc-certs/${dom}/fullchain.pem;
+    ssl_certificate_key /etc/oc-certs/${dom}/key.pem;
+
+    # 走 Caddy 的内网端口，由 Caddy 负责路径和 WebSocket/SSE
+    location / {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+
+EOF
+    done
+  } > "$f"
+  chmod 644 "$f"
+
+  printf '\n%s反代配置已生成：%s%s\n' "$B" "$f" "$R"
+  printf '%s把它复制进 nginx，然后 nginx -t && nginx -s reload%s\n\n' "$DIM" "$R"
 }
 
 # ---------------------------------------------------------------------------
@@ -1154,10 +1321,12 @@ cmd_verify() {
             awk '{n=$0; sub(/^[^ ]+ /,"",n); split($0,a," "); print a[1], a[2], (index($0,"(healthy)")?"healthy":(index($0,"(unhealthy)")?"unhealthy":"none"))}')
 
   head1 "2. 端口暴露"
-  if docker port oc-caddy 2>/dev/null | grep -qE '^443|:443'; then
-    p "Caddy 已暴露 443"
+  local https_port
+  https_port="$(envget CADDY_HTTPS_PORT)"; https_port="${https_port:-443}"
+  if docker port oc-caddy 2>/dev/null | grep -qE ":${https_port}"; then
+    p "Caddy 已暴露 ${https_port}（HTTPS）"
   else
-    f "Caddy 未暴露 443"
+    f "Caddy 未暴露 ${https_port}"
   fi
   if docker port oc-openchamber 2>/dev/null | grep -qE '^3000|:3000'; then
     f "OpenChamber 的 3000 端口暴露到宿主机（应该只走 caddy）"
@@ -1394,17 +1563,54 @@ cmd_status() {
 
 cmd_cert() {
   need_env
+  local cert_mode
+  cert_mode="$(envget CERT_MODE)"; cert_mode="${cert_mode:-caddy}"
+
   head1 "证书状态"
-  # Caddy 自动续期，这里只是把已签发的证书列出来
-  docker exec oc-caddy sh -c '
-    find /data/caddy/certificates -name "*.crt" 2>/dev/null | while read -r f; do
-      echo "--- $f"
-      openssl x509 -in "$f" -noout -subject -enddate 2>/dev/null | sed "s/^/    /"
+
+  if [[ "$cert_mode" == "acme" ]]; then
+    # acme.sh 签发的证书在 /etc/oc-certs/<域名>/
+    local found=0 d
+    for d in /etc/oc-certs/*/; do
+      [[ -f "${d}fullchain.pem" ]] || continue
+      found=1
+      printf '  %s%s%s\n' "$B" "$(basename "$d")" "$R"
+      openssl x509 -in "${d}fullchain.pem" -noout -subject -issuer -dates 2>/dev/null | sed 's/^/    /'
+      # 剩余天数
+      local end epoch now days
+      end="$(openssl x509 -in "${d}fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)"
+      epoch="$(date -d "$end" +%s 2>/dev/null || echo 0)"
+      now="$(date +%s)"
+      if (( epoch > 0 )); then
+        days=$(( (epoch - now) / 86400 ))
+        if (( days > 30 )); then
+          printf '    %s剩余 %d 天%s\n' "$GRN" "$days" "$R"
+        else
+          printf '    %s剩余 %d 天（将自动续期）%s\n' "$YEL" "$days" "$R"
+        fi
+      fi
+      echo
     done
-  ' || warn "无法读取证书"
-  echo
-  info "Caddy 会在证书到期前 30 天自动续期，无需 cron"
-  info "续期日志：./ocstack logs caddy | grep -i renew"
+    (( found == 0 )) && warn "还没有签发证书（/etc/oc-certs）"
+
+    echo
+    if crontab -l 2>/dev/null | grep -q acme.sh; then
+      info "自动续期：已配置（acme.sh cron，每天 03:17）"
+    else
+      warn "自动续期：未配置 cron，请运行 ./scripts/acme-helper.sh renew 手动续期"
+    fi
+    info "查看 ACme 日志：/opt/acme.sh/acme.sh --list"
+  else
+    docker exec oc-caddy sh -c '
+      find /data/caddy/certificates -name "*.crt" 2>/dev/null | while read -r f; do
+        echo "--- $f"
+        openssl x509 -in "$f" -noout -subject -enddate 2>/dev/null | sed "s/^/    /"
+      done
+    ' || warn "无法读取证书"
+    echo
+    info "Caddy 会在证书到期前 30 天自动续期，无需 cron"
+    info "续期日志：./ocstack logs caddy | grep -i renew"
+  fi
 }
 
 cmd_upgrade() {
@@ -1510,8 +1716,15 @@ print_summary() {
   printf '%s%s│  安装完成                                                │%s\n' "$B" "$GRN" "$R"
   printf '%s%s╰──────────────────────────────────────────────────────────╯%s\n' "$B" "$GRN" "$R"
 
+  local cert_mode caddy_https_port
+  cert_mode="$(envget CERT_MODE)"; cert_mode="${cert_mode:-caddy}"
+  caddy_https_port="$(envget CADDY_HTTPS_PORT)"; caddy_https_port="${caddy_https_port:-443}"
+
   printf '\n%s【OpenChamber】%s  —— 平时用这个\n' "$B" "$R"
-  if [[ -n "$oc" && "$tls_ok" == "true" ]]; then
+  if [[ -n "$oc" && "$tls_ok" == "true" && "$cert_mode" == "acme" && "$caddy_https_port" != "443" ]]; then
+    # acme + 高位端口：地址必须带端口号，否则打不开
+    printf '   地址    %shttps://%s:%s%s\n' "$GRN" "$oc" "$caddy_https_port" "$R"
+  elif [[ -n "$oc" && "$tls_ok" == "true" ]]; then
     printf '   地址    %shttps://%s%s\n' "$GRN" "$oc" "$R"
   elif [[ -n "$oc" && "$tls_ok" != "true" ]]; then
     # 证书没成功：给出现在真能打开的地址，别让人对着打不开的域名试
@@ -1529,7 +1742,9 @@ print_summary() {
     printf '   密钥请在原网关后台创建后，填进 OpenChamber 设置 → 提供商\n' "$DIM" "$R"
   else
     printf '\n%s【Sub2API 后台】%s  —— 填上游地址和 Key 的地方\n' "$B" "$R"
-    if [[ -n "$api" && "$tls_ok" == "true" ]]; then
+    if [[ -n "$api" && "$tls_ok" == "true" && "$cert_mode" == "acme" && "$caddy_https_port" != "443" ]]; then
+      printf '   地址    %shttps://%s:%s%s\n' "$GRN" "$api" "$caddy_https_port" "$R"
+    elif [[ -n "$api" && "$tls_ok" == "true" ]]; then
       printf '   地址    %shttps://%s%s\n' "$GRN" "$api" "$R"
     else
       printf '   地址    %shttp://127.0.0.1:%s%s  （需 SSH 隧道）\n' "$GRN" "$sub_port" "$R"

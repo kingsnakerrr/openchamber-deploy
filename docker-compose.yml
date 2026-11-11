@@ -20,11 +20,12 @@ services:
     container_name: oc-caddy
     restart: unless-stopped
     ports:
-      # 端口可在 .env 里改（CADDY_HTTP_PORT / CADDY_HTTPS_PORT），
-      # 用于 80/443 已被 nginx 等占用、需要放在前置反代后面的场景
-      - "${CADDY_HTTP_PORT:-80}:80"
-      - "${CADDY_HTTPS_PORT:-443}:443"
-      - "${CADDY_HTTPS_PORT:-443}:443/udp"
+      # 宿主机端口与容器内端口保持一致。
+      # Caddyfile 里会用 http_port / https_port 指令让 Caddy 监听相同端口，
+      # 这样重定向生成的 URL 会带上正确端口（例如 https://xxx:18443）。
+      - "${CADDY_HTTP_PORT:-80}:${CADDY_HTTP_PORT:-80}"
+      - "${CADDY_HTTPS_PORT:-443}:${CADDY_HTTPS_PORT:-443}"
+      - "${CADDY_HTTPS_PORT:-443}:${CADDY_HTTPS_PORT:-443}/udp"
       # IP 模式的两个明文入口直接在这里映射（端口来自 .env，安装时探测空闲值）。
       # 有域名时这两个端口不会被 Caddy 监听（Caddyfile 里没有对应站点），
       # 所以不会额外暴露服务。
@@ -34,6 +35,8 @@ services:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+      # acme.sh 签发的外部证书（CERT_MODE=acme 时使用）
+      - /etc/oc-certs:/certs:ro
     environment:
       - OC_DOMAIN=${OC_DOMAIN:-}
       - API_DOMAIN=${API_DOMAIN:-}
