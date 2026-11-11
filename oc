@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# =============================================================================
+# oc —— oc-stack 总控台
+#
+#   oc              交互式菜单
+#   oc <命令>       直接执行
+# =============================================================================
+set -uo pipefail
+
+OCSTACK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$OCSTACK" || exit 1
+
+# ---- 颜色 -------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  R=$'\033[0m'; DIM=$'\033[2m'; B=$'\033[1m'
+  RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'
+  CYA=$'\033[36m'; MAG=$'\033[35m'
+else
+  R=""; DIM=""; B=""; RED=""; GRN=""; YEL=""; CYA=""; MAG=""
+fi
+
+envget() {
+  local v
+  v="$(grep -E "^$1=" .env 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  v="${v#\"}"; v="${v%\"}"; printf '%s' "$v"
+}
+
+pause() {
+  [[ -t 0 ]] || return 0
+  printf '\n%s按回车继续...%s' "$DIM" "$R"
+  read -r _ || true
+}
+
+header() {
+  clear 2>/dev/null || true
+  printf '%s%s╭──────────────────────────────────────────────────────────╮%s\n' "$B" "$CYA" "$R"
+  printf '%s%s│           oc-stack 控制台                                │%s\n' "$B" "$CYA" "$R"
+  printf '%s%s╰──────────────────────────────────────────────────────────╯%s\n' "$B" "$CYA" "$R"
+  local oc api mode
+  oc="$(envget OC_DOMAIN)"; api="$(envget API_DOMAIN)"; mode="$(envget GATEWAY_MODE)"
+  printf '  %s域名%s     %s\n' "$DIM" "$R" "${oc:-（未配置，IP 模式）}"
+  [[ -n "$api" ]] && printf '  %s网关域%s   %s\n' "$DIM" "$R" "$api"
+  printf '  %s模式%s     %s\n' "$DIM" "$R" "${mode:-local}"
+  printf '  %s端口%s     HTTPS %s / HTTP %s\n' "$DIM" "$R" \
+    "$(envget CADDY_HTTPS_PORT)" "$(envget CADDY_HTTP_PORT)"
+  echo
+}
+
+# =============================================================================
+# 各项功能
+# =============================================================================
+act_status() {
+  echo
+  ./ocstack status
+}
+
+act_verify() {
+  echo
+  ./ocstack verify
+  local rc=$?
+  echo
+  if (( rc == 0 )); then
+    printf '%s  全部通过%s\n' "$GRN" "$R"
+  else
+    printf '%s  有检查项失败，看上面输出%s\n' "$RED" "$R"
+  fi
+}
+
+act_urls() {
+  echo
+  local oc api https_port
+  oc="$(envget OC_DOMAIN)"; api="$(envget API_DOMAIN)"
+  https_port="$(envget CADDY_HTTPS_PORT)"; https_port="${https_port:-443}"
+  local ip
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')"
+  ip="${ip:-<IP>}"
+
+  printf '%s可用地址%s\n\n' "$B" "$R"
+  if [[ -n "$oc" ]]; then
+    if [[ "$https_port" == "443" ]] || [[ -f /usr/local/nginx/servers/oc-stack-chamber.conf ]]; then
+      printf '  %sOpenChamber%s  %shttps://%s%s\n' "$B" "$R" "$GRN" "$oc" "$R"
+    else
+      printf '  %sOpenChamber%s  %shttps://%s:%s%s\n' "$B" "$R" "$GRN" "$oc" "$https_port" "$R"
+      printf '  %s              也可用 http://%s:%s%s\n' "$DIM" "$ip" "$(envget HTTP_PORT)" "$R"
+    fi
+  else
+    printf '  %sOpenChamber%s  %shttp://%s:%s%s\n' "$B" "$R" "$GRN" "$ip" "$(envget HTTP_PORT)" "$R"
+  fi
+
+  if [[ -n "$api" ]]; then
+    if [[ "$https_port" == "443" ]] || [[ -f /usr/local/nginx/servers/oc-stack-sub2api.conf ]]; then
+      printf '  %sSub2API%s      %shttps://%s%s\n' "$B" "$R" "$GRN" "$api" "$R"
+    else
+      printf '  %sSub2API%s      %shttps://%s:%s%s\n' "$B" "$R" "$GRN" "$api" "$https_port" "$R"
+    fi
+  fi
+
+  echo
+  printf '%s登录凭据%s\n\n' "$B" "$R"
+  printf '  OpenChamber  %s\n' "$(envget OPENCHAMBER_UI_PASSWORD)"
+  printf '  Sub2API      %s / %s\n' "$(envget ADMIN_EMAIL)" "$(envget ADMIN_PASSWORD)"
+}
+
+# ---- 443 端口共享 -----------------------------------------------------------
+act_port443() {
+  echo
+  printf '%s443 端口共享（SNI 分流）%s\n\n' "$B" "$R"
+
+  if [[ ! -d /usr/local/nginx/servers ]]; then
+    printf '  这台机器没有 /usr/local/nginx，无法使用此功能。\n'
+    printf '  %s该功能依赖前置 nginx 做 SNI 分流。%s\n' "$DIM" "$R"
+    return 1
+  fi
+
+  local caddy_https
+  caddy_https="$(envget CADDY_HTTPS_PORT)"; caddy_https="${caddy_https:-18200}"
+
+  printf '  当前 HTTPS 端口：%s\n\n' "$caddy_https"
+
+  if [[ -f /usr/local/nginx/servers/oc-stack-chamber.conf ]]; then
+    printf '  %s状态：已启用%s（nginx 按域名把 443 转给 Caddy）\n\n' "$GRN" "$R"
+    printf '    [1] 重新生成配置并重载\n'
+    printf '    [2] 关闭（改回用高位端口访问）\n'
+    printf '    [0] 返回\n\n'
+    printf '  选择 [0]: '
+    local c; read -r c || c=0
+    case "$c" in
+      1) apply_443 "regen" ;;
+      2) apply_443 "off" ;;
+      *) return 0 ;;
+    esac
+  else
+    printf '  启用后可以用 %shttps://域名%s（不带端口）访问，\n' "$GRN" "$R"
+    printf '  由现有 nginx 按域名分流到 Caddy 的 %s 端口。\n\n' "$caddy_https"
+    printf '  前置条件：nginx 已有通配符证书（*.你的域名），\n'
+    printf '  且 443 被某个 TLS 终结器占用并会转发给 nginx 的 8001。\n\n'
+    printf '    [1] 启用\n'
+    printf '    [0] 返回\n\n'
+    printf '  选择 [0]: '
+    local c; read -r c || c=0
+    [[ "$c" == "1" ]] && apply_443 "on" || return 0
+  fi
+}
+
+apply_443() {
+  local mode="$1"
+  local oc api caddy_https
+  oc="$(envget OC_DOMAIN)"; api="$(envget API_DOMAIN)"
+  caddy_https="$(envget CADDY_HTTPS_PORT)"; caddy_https="${caddy_https:-18200}"
+
+  if [[ "$mode" == "off" ]]; then
+    rm -f /usr/local/nginx/servers/oc-stack-chamber.conf \
+          /usr/local/nginx/servers/oc-stack-sub2api.conf
+    /usr/local/nginx/sbin/nginx -t >/dev/null 2>&1 && \
+      /usr/local/nginx/sbin/nginx -s reload >/dev/null 2>&1
+    printf '  %s已关闭 443 共享，请改用 https://域名:%s%s\n' "$YEL" "$caddy_https" "$R"
+    return 0
+  fi
+
+  if [[ -z "$oc" ]]; then
+    printf '  %s没有配域名，无法启用 443 共享%s\n' "$RED" "$R"
+    return 1
+  fi
+
+  # 备份
+  local bak="/root/nginx-servers-backup-$(date +%s)"
+  cp -r /usr/local/nginx/servers "$bak" 2>/dev/null && \
+    printf '  %s已备份 nginx 配置到 %s%s\n' "$DIM" "$bak" "$R"
+
+  CADDY_PORT="$caddy_https" OC_DOMAIN="$oc" API_DOMAIN="$api" \
+    ./scripts/proxy-nginx.sh 2>&1 | sed 's/^/  /'
+
+  echo
+  printf '  验证：\n'
+  sleep 2
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' -m 15 "https://${oc}/" 2>/dev/null || echo 000)"
+  if [[ "$code" =~ ^[23] ]]; then
+    printf '  %s%s → %s  ✅%s\n' "$GRN" "https://${oc}/" "$code" "$R"
+  else
+    printf '  %shttps://%s/ → %s%s\n' "$YEL" "$oc" "$code" "$R"
+    printf '  %s可以回退：选 [2] 关闭，或恢复备份%s\n' "$DIM" "$R"
+  fi
+}
+
+# ---- 更换域名 ---------------------------------------------------------------
+act_domain() {
+  echo
+  printf '%s更换域名%s\n\n' "$B" "$R"
+  printf '  当前 OpenChamber 域名：%s\n' "$(envget OC_DOMAIN)"
+  printf '  当前 Sub2API 域名：    %s\n\n' "$(envget API_DOMAIN)"
+
+  printf '  新 OpenChamber 域名（回车保持不变）: '
+  local new_oc; read -r new_oc || new_oc=""
+  printf '  新 Sub2API 域名（回车保持不变，输 - 表示清空）: '
+  local new_api; read -r new_api || new_api=""
+
+  local oc api
+  oc="$(envget OC_DOMAIN)"; api="$(envget API_DOMAIN)"
+  [[ -n "$new_oc" ]] && oc="$new_oc"
+  [[ "$new_api" == "-" ]] && api=""
+  [[ -n "$new_api" && "$new_api" != "-" ]] && api="$new_api"
+
+  [[ -z "$oc" ]] && { printf '  %s域名不能为空%s\n' "$RED" "$R"; return 1; }
+
+  printf '\n  将改为：\n    OpenChamber  %s\n    Sub2API      %s\n\n' "$oc" "${api:-（不设）}"
+  printf '  确认？[y/N]: '
+  local c; read -r c || c=""
+  [[ "$c" =~ ^[Yy] ]] || { printf '  已取消\n'; return 0; }
+
+  ./ocstack install --yes --oc-domain "$oc" ${api:+--api-domain "$api"} 2>&1 | tail -20
+  echo
+  printf '  %s注意：新域名要先在 DNS 加 A 记录指向本机，否则证书申请会失败。%s\n' "$YEL" "$R"
+  printf '  %s改完可用「443 端口共享」重新绑定域名。%s\n' "$DIM" "$R"
+}
+
+# ---- 其它 -------------------------------------------------------------------
+act_cert()    { echo; ./ocstack cert; }
+act_logs()    {
+  printf '\n  [1] caddy  [2] openchamber  [3] sub2api  [0] 返回\n  选择: '
+  local c; read -r c || c=0
+  case "$c" in
+    1) ./ocstack logs caddy ;;
+    2) ./ocstack logs openchamber ;;
+    3) ./ocstack logs sub2api ;;
+    *) return 0 ;;
+  esac
+}
+act_bootstrap(){ echo; ./ocstack bootstrap; }
+act_restart() { echo; ./ocstack restart; printf '%s  已重启%s\n' "$GRN" "$R"; }
+act_upgrade() { echo; ./ocstack upgrade; }
+act_backup() {
+  echo
+  local f="/root/oc-stack-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  printf '  正在打包 .env + data/ + workspaces/ ...\n'
+  tar czf "$f" .env data workspaces 2>/dev/null
+  printf '  %s已备份：%s（%s）%s\n' "$GRN" "$f" "$(du -h "$f" 2>/dev/null | cut -f1)" "$R"
+}
+act_autostart() {
+  echo
+  printf '  [1] 查看状态  [2] 开启  [3] 关闭  [0] 返回\n  选择: '
+  local c; read -r c || c=0
+  case "$c" in
+    1) ./ocstack autostart status ;;
+    2) ./ocstack autostart enable ;;
+    3) ./ocstack autostart disable ;;
+    *) return 0 ;;
+  esac
+}
+act_uninstall() {
+  echo
+  printf '  %s这会停止并删除所有容器%s\n\n' "$RED" "$R"
+  printf '  [1] 卸载（保留数据）\n  [2] 卸载并删除全部数据\n  [0] 返回\n  选择 [0]: '
+  local c; read -r c || c=0
+  case "$c" in
+    1) ./ocstack uninstall --yes ;;
+    2) ./ocstack uninstall --yes --purge ;;
+    *) return 0 ;;
+  esac
+}
+
+# =============================================================================
+# 菜单
+# =============================================================================
+menu() {
+  while true; do
+    header
+    printf '  %s1%s  查看状态          %s服务、端口、地址%s\n'    "$GRN" "$R" "$DIM" "$R"
+    printf '  %s2%s  自检              %s12 项健康检查%s\n'        "$GRN" "$R" "$DIM" "$R"
+    printf '  %s3%s  查看地址密码      %s所有访问地址和凭据%s\n'  "$GRN" "$R" "$DIM" "$R"
+    echo
+    printf '  %s4%s  443 端口共享      %s让域名不带端口访问%s\n'  "$CYA" "$R" "$DIM" "$R"
+    printf '  %s5%s  更换域名          %s改域名并重新签证书%s\n'  "$CYA" "$R" "$DIM" "$R"
+    echo
+    printf '  %s6%s  证书状态          %s有效期与剩余天数%s\n'    "$DIM" "$R" "$DIM" "$R"
+    printf '  %s7%s  查看日志          %s实时日志%s\n'            "$DIM" "$R" "$DIM" "$R"
+    printf '  %s8%s  配置上游          %s自动建分组和密钥%s\n'    "$DIM" "$R" "$DIM" "$R"
+    echo
+    printf '  %s9%s  重启容器\n'                                  "$DIM" "$R"
+    printf '  %s10%s 升级版本\n'                                   "$DIM" "$R"
+    printf '  %s11%s 备份数据          %s打包 .env + data%s\n'     "$DIM" "$R" "$DIM" "$R"
+    printf '  %s12%s 开机自启\n'                                   "$DIM" "$R"
+    printf '  %s13%s 卸载\n'                                       "$RED" "$R"
+    echo
+    printf '  %s0%s  退出\n'                                       "$DIM" "$R"
+    echo
+    printf '  请输入编号: '
+    local c; read -r c || c=0
+    echo
+    case "$c" in
+      1) act_status ;;
+      2) act_verify ;;
+      3) act_urls ;;
+      4) act_port443 ;;
+      5) act_domain ;;
+      6) act_cert ;;
+      7) act_logs; continue ;;
+      8) act_bootstrap ;;
+      9) act_restart ;;
+      10) act_upgrade ;;
+      11) act_backup ;;
+      12) act_autostart ;;
+      13) act_uninstall ;;
+      0|q|Q) exit 0 ;;
+      *) printf '  %s无效编号%s\n' "$RED" "$R" ;;
+    esac
+    pause
+  done
+}
+
+# =============================================================================
+# 入口
+# =============================================================================
+case "${1:-}" in
+  "")        menu ;;
+  status)    act_status ;;
+  verify)    act_verify ;;
+  urls)      act_urls ;;
+  443)       act_port443 ;;
+  domain)    act_domain ;;
+  cert)      act_cert ;;
+  logs)      act_logs ;;
+  bootstrap) act_bootstrap ;;
+  restart)   act_restart ;;
+  upgrade)   act_upgrade ;;
+  backup)    act_backup ;;
+  autostart) act_autostart ;;
+  uninstall) act_uninstall ;;
+  help|-h|--help)
+    cat <<'EOF'
+oc —— oc-stack 控制台
+
+  oc                交互式菜单
+  oc status         查看状态
+  oc verify         自检
+  oc urls           查看地址和密码
+  oc 443            443 端口共享（域名不带端口访问）
+  oc domain         更换域名
+  oc cert           证书状态
+  oc logs           查看日志
+  oc bootstrap      配置上游
+  oc restart        重启
+  oc upgrade        升级
+  oc backup         备份数据
+  oc autostart      开机自启
+  oc uninstall      卸载
+
+也兼容 ./ocstack <命令> 的旧用法。
+EOF
+    ;;
+  *) printf '未知命令：%s（oc help 查看）\n' "$1"; exit 1 ;;
+esac

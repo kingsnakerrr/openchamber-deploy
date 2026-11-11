@@ -203,6 +203,14 @@ fi
 
 [[ -f "$INSTALL_DIR/ocstack" ]] || die "缺少 ocstack，目录内容异常"
 chmod +x "$INSTALL_DIR/ocstack"
+[[ -f "$INSTALL_DIR/oc" ]] && chmod +x "$INSTALL_DIR/oc"
+
+# 把 oc 装到 PATH 里，任何目录都能直接用
+if [[ -f "$INSTALL_DIR/oc" ]]; then
+  ln -sfn "$INSTALL_DIR/oc" /usr/local/bin/oc 2>/dev/null && \
+    ok "已安装控制台命令：oc（输入 oc 即可）" || \
+    warn "无法创建 /usr/local/bin/oc，请手动：ln -sf $INSTALL_DIR/oc /usr/local/bin/oc"
+fi
 
 # ---------------------------------------------------------------------------
 # 4. 交给 ocstack install
