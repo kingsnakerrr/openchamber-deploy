@@ -64,6 +64,50 @@ Caddy 用 tls 指令加载这些证书，监听高位端口
 
 邮箱可以不填——证书照样签发，只是收不到到期提醒。
 
+## 证书续期：零停机
+
+签证书和续期**不需要停止任何服务，不占用 80 端口**。
+
+原理是把 ACME 校验文件写到 nginx 能直接对外提供的目录：
+
+```nginx
+# nginx 的 80 端口里加这一段（oc cert-fix 会自动加）
+location ^~ /.well-known/acme-challenge/ {
+    root /var/www/acme;
+    default_type text/plain;
+}
+```
+
+然后 acme.sh 用 webroot 模式：
+
+```bash
+acme.sh --issue -d 你的域名 --webroot /var/www/acme
+```
+
+这样 Let's Encrypt 的校验请求直接由 nginx 静态返回，**不涉及 MM 转发、不涉及 Caddy、不需要停服务**。
+
+实测（强制续期时记录 nginx 主进程 PID）：
+
+```
+续期前 nginx PID=311059
+Cert success.
+续期后 nginx PID=311059     ← 一致，进程没重启
+续期期间 dp.222321.xyz → 200
+```
+
+对比三种验证方式：
+
+| 方式 | 需要 80 | 需要 443 | 需要停服务 |
+|---|---|---|---|
+| standalone | 独占 80 | 否 | **是** |
+| TLS-ALPN | 否 | 独占 443 | **是** |
+| **webroot** | 只需能读文件 | 否 | **否** ✅ |
+| DNS | 否 | 否 | 否（但要改 DNS） |
+
+首次安装时脚本自动优先用 webroot；如果 nginx 不可用才退回 standalone（那时才会临时停 nginx，且失败也会恢复）。
+
+手动切换：`oc cert-fix`，或菜单第 7 项。
+
 ## 控制台
 
 装完直接输入 `oc`：

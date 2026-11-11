@@ -20,6 +20,11 @@ ACME_HOME="${ACME_HOME:-/opt/acme.sh}"
 ACME_BIN="${ACME_HOME}/acme.sh"
 CERT_ROOT="${CERT_ROOT:-/etc/oc-certs}"
 
+# webroot 验证：把挑战文件写到 nginx 能对外提供的目录，
+# 完全不需要停止 nginx / 占用 80 端口。
+WEBROOT="${WEBROOT:-/var/www/acme}"
+NGINX_PREFIX="${NGINX_PREFIX:-/usr/local/nginx}"
+
 if [[ -t 1 ]]; then
   R=$'\033[0m'; DIM=$'\033[2m'; B=$'\033[1m'
   RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYA=$'\033[36m'
@@ -72,6 +77,104 @@ ensure_acme() {
   chmod +x "$ACME_BIN"
   [[ -x "$ACME_BIN" ]] || die "acme.sh 安装失败"
   ok "acme.sh 已安装：$("$ACME_BIN" --version 2>/dev/null | head -1)"
+}
+
+# ---------------------------------------------------------------------------
+# 让 nginx 的 80 端口放行 ACME 挑战路径
+#
+# 这是"零停机签证书"的关键：不停止 nginx、不占用 80，
+# 只加一个 location 把 /.well-known/acme-challenge/ 指向本地目录。
+# ---------------------------------------------------------------------------
+ensure_nginx_acme() {
+  local conf="$NGINX_PREFIX/nginx.conf"
+
+  if [[ ! -f "$conf" ]]; then
+    warn "找不到 $conf，无法自动放行 ACME 路径"
+    return 1
+  fi
+
+  # 已经有了就跳过
+  if grep -q "acme-challenge" "$conf" 2>/dev/null; then
+    ok "nginx 已放行 ACME 挑战路径"
+    mkdir -p "$WEBROOT/.well-known/acme-challenge"
+    return 0
+  fi
+
+  info "在 nginx 中放行 ACME 挑战路径（不影响现有站点）"
+  cp "$conf" "${conf}.bak.$(date +%s)"
+
+  # 在 listen 80 的 server 块里插入 location，把原来的 return 301 降级为兜底
+  python3 - "$conf" "$WEBROOT" <<'PY'
+import sys, re
+conf, webroot = sys.argv[1], sys.argv[2]
+src = open(conf, encoding="utf-8").read()
+
+# 找到 「listen 80; ... return 301 ...」 这一段
+pat = re.compile(
+    r'(listen\s+80;\s*
+\s*listen\s+\[::\]:80;\s*
+)'
+    r'(\s*return\s+301\s+https://\$host\$request_uri;)',
+    re.M
+)
+
+replacement = (
+    r''
+    '
+'
+    '        # ACME 证书校验路径：由 oc-stack 添加，续期时不需停 nginx
+'
+    '        location ^~ /.well-known/acme-challenge/ {
+'
+    f'            root {webroot};
+'
+    '            default_type text/plain;
+'
+    '            try_files $uri =404;
+'
+    '        }
+'
+    '
+'
+    '        location / {
+'
+    r'            return 301 https://$host$request_uri;'
+    '
+'
+    '        }'
+)
+
+new, n = pat.subn(replacement, src, count=1)
+if n == 0:
+    print("NO_MATCH")
+    sys.exit(2)
+
+open(conf, "w", encoding="utf-8").write(new)
+print("OK")
+PY
+
+  if [[ $? -ne 0 ]] || ! grep -q "acme-challenge" "$conf"; then
+    warn "自动修改 nginx 配置失败，请手动在 80 端口的 server 块加入："
+    cat <<EOF
+    location ^~ /.well-known/acme-challenge/ {
+        root ${WEBROOT};
+        default_type text/plain;
+    }
+EOF
+    return 1
+  fi
+
+  mkdir -p "$WEBROOT/.well-known/acme-challenge"
+
+  if "$NGINX_PREFIX/sbin/nginx" -t >/dev/null 2>&1; then
+    "$NGINX_PREFIX/sbin/nginx" -s reload >/dev/null 2>&1
+    ok "nginx 已放行 ACME 路径并重载"
+  else
+    warn "nginx 配置校验失败，已回滚"
+    cp "${conf}.bak."* "$conf" 2>/dev/null || true
+    "$NGINX_PREFIX/sbin/nginx" -s reload >/dev/null 2>&1 || true
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -166,22 +269,42 @@ do_issue() {
   fi
 
   if [[ "$need_issue" == "true" ]]; then
-    release_port80
-
-    # 无论如何都要把 80 还回去：失败、中断、被 kill 都要恢复，
-    # 否则机器上原有的 nginx 站点会全部挂掉。
-    trap 'restore_port80' EXIT INT TERM
-
     local issued="false"
-    info "为 $domain 申请证书（standalone，临时占用 80 端口）"
-    if "$ACME_BIN" --issue -d "$domain" --standalone --keylength ec-256 \
-         --server letsencrypt >/tmp/acme-issue.log 2>&1; then
-      issued="true"
-    else
-      tail -15 /tmp/acme-issue.log
+
+    # ---- 首选 webroot：不停任何服务、不占用 80 ----
+    if ensure_nginx_acme 2>/dev/null; then
+      info "为 $domain 申请证书（webroot 模式，无需停止服务）"
+      if "$ACME_BIN" --issue -d "$domain" --webroot "$WEBROOT" --keylength ec-256 \
+           --server letsencrypt >/tmp/acme-issue.log 2>&1; then
+        issued="true"
+        ok "证书已签发（全程未中断服务）"
+      else
+        warn "webroot 模式失败，改用 standalone"
+        tail -6 /tmp/acme-issue.log | sed 's/^/    /'
+      fi
+    fi
+
+    # ---- 后备 standalone：确实需要独占 80 时才用 ----
+    if [[ "$issued" != "true" ]]; then
+      release_port80
+
+      # 无论如何都要把 80 还回去：失败、中断、被 kill 都要恢复，
+      # 否则机器上原有的 nginx 站点会全部挂掉。
+      trap 'restore_port80' EXIT INT TERM
+
+      info "为 $domain 申请证书（standalone，临时占用 80 端口）"
+      if "$ACME_BIN" --issue -d "$domain" --standalone --keylength ec-256 \
+           --server letsencrypt >/tmp/acme-issue.log 2>&1; then
+        issued="true"
+      else
+        tail -15 /tmp/acme-issue.log
+        restore_port80
+        trap - EXIT INT TERM
+        die "证书申请失败，见上方 acme.sh 输出（完整日志 /tmp/acme-issue.log）"
+      fi
+
       restore_port80
       trap - EXIT INT TERM
-      die "证书申请失败，见上方 acme.sh 输出（完整日志 /tmp/acme-issue.log）"
     fi
 
     if [[ "$issued" == "true" ]]; then
@@ -190,27 +313,20 @@ do_issue() {
       # 续期时也要让出 80：acme.sh 有一套 hook 机制
       local pre_hook="/etc/oc-certs/pre-hook.sh"
       local post_hook="/etc/oc-certs/post-hook.sh"
+
+      # 续期策略：webroot 模式下 80 端口照常开着，nginx 提供挑战文件，
+      # 不需要停任何服务。所以 hook 只做一件事：续期成功后让 Caddy 重载证书。
       cat > "$pre_hook" <<'EOS'
 #!/bin/sh
-# 续期前让出 80 端口（nginx 等），记下被停的服务
-for svc in nginx apache2 httpd; do
-  if systemctl is-active --quiet "$svc" 2>/dev/null; then
-    echo "$svc" > /etc/oc-certs/.stopped-svc
-    systemctl stop "$svc" 2>/dev/null || true
-  fi
-done
-sleep 1
+# webroot 模式不需要停服务，这里什么都不做。
+# 只有 standalone 模式才需要让出 80，那条路径不走这个 hook。
+exit 0
 EOS
       cat > "$post_hook" <<'EOS'
 #!/bin/sh
-# 续期后恢复 80 端口
-if [ -f /etc/oc-certs/.stopped-svc ]; then
-  while read -r svc; do
-    [ -n "$svc" ] && systemctl start "$svc" 2>/dev/null || true
-  done < /etc/oc-certs/.stopped-svc
-  rm -f /etc/oc-certs/.stopped-svc
-fi
+# 续期成功后让 Caddy 重新加载证书（不重启容器，不中断连接）
 docker exec oc-caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || true
+exit 0
 EOS
       chmod +x "$pre_hook" "$post_hook"
 
@@ -225,8 +341,6 @@ EOS
       fi
     fi
 
-    restore_port80
-    trap - EXIT INT TERM
   fi
 
   [[ -f "$out/fullchain.pem" ]] || die "证书文件不存在：$out/fullchain.pem"
@@ -278,7 +392,8 @@ do_status() {
 
 case "${1:-}" in
   issue)  do_issue "${2:-}" "${3:-}" ;;
+  ensure-nginx) ensure_nginx_acme ;;
   status) do_status "${2:-}" ;;
   renew)  ensure_acme; "$ACME_BIN" --cron --home "$ACME_HOME" ;;
-  *)      die "用法：$0 issue <域名> [邮箱] | status [域名] | renew" ;;
+  *)      die "用法：$0 issue <域名> [邮箱] | status [域名] | renew | ensure-nginx" ;;
 esac

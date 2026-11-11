@@ -273,7 +273,49 @@ act_domain() {
 }
 
 # ---- 其它 -------------------------------------------------------------------
-act_cert()    { echo; ./ocstack cert; }
+act_cert() {
+  echo
+  ./ocstack cert
+  echo
+  # 续期方式说明
+  if [[ -f /var/www/acme/.well-known/acme-challenge ]]; then :; fi
+  if grep -q "acme-challenge" /usr/local/nginx/nginx.conf 2>/dev/null; then
+    printf '  %s续期方式：webroot（不停 nginx、不占用 80，零停机）%s\n' "$GRN" "$R"
+  else
+    printf '  %s续期方式：standalone（需要临时停 nginx 占用 80）%s\n' "$YEL" "$R"
+    printf '  %s建议改成零停机：oc cert-fix%s\n' "$DIM" "$R"
+  fi
+}
+
+# 把续期改成 webroot 零停机模式
+act_cert_fix() {
+  echo
+  printf '%s证书续期改为零停机模式%s\n\n' "$B" "$R"
+  printf '  当前会：停 nginx → 占用 80 → 签完再拉起\n'
+  printf '  改为后：不停止任何服务，nginx 直接提供校验文件\n\n'
+  printf '  继续？[y/N]: '
+  local c; read -r c || c=""
+  [[ "$c" =~ ^[Yy] ]] || { printf '  已取消\n'; return 0; }
+
+  echo
+  WEBROOT=/var/www/acme ./scripts/acme-helper.sh ensure-nginx 2>&1 | sed 's/^/  /'
+
+  echo
+  printf '  验证：\n'
+  local probe="oc-probe-$(date +%s)"
+  echo "$probe" > /var/www/acme/.well-known/acme-challenge/probe 2>/dev/null
+  local oc; oc="$(envget OC_DOMAIN)"
+  if [[ -n "$oc" ]]; then
+    local got
+    got="$(curl -s -m 10 "http://${oc}/.well-known/acme-challenge/probe" 2>/dev/null)"
+    if [[ "$got" == "$probe" ]]; then
+      printf '  %s✓ 从公网能访问校验文件，续期不再需要停服务%s\n' "$GRN" "$R"
+    else
+      printf '  %s✗ 公网访问失败，可能 80 端口不通%s\n' "$RED" "$R"
+    fi
+    rm -f /var/www/acme/.well-known/acme-challenge/probe
+  fi
+}
 act_logs()    {
   printf '\n  [1] caddy  [2] openchamber  [3] sub2api  [0] 返回\n  选择: '
   local c; read -r c || c=0
@@ -454,15 +496,16 @@ menu() {
     printf '  %s5%s  更换域名          %s改域名并重新签证书%s\n'  "$CYA" "$R" "$DIM" "$R"
     echo
     printf '  %s6%s  证书状态          %s有效期与剩余天数%s\n'    "$DIM" "$R" "$DIM" "$R"
-    printf '  %s7%s  查看日志          %s实时日志%s\n'            "$DIM" "$R" "$DIM" "$R"
-    printf '  %s8%s  配置上游          %s自动建分组和密钥%s\n'    "$DIM" "$R" "$DIM" "$R"
+    printf '  %s7%s  证书续期方式      %s改成零停机（不停 nginx）%s\n' "$DIM" "$R" "$DIM" "$R"
+    printf '  %s8%s  查看日志          %s实时日志%s\n'            "$DIM" "$R" "$DIM" "$R"
+    printf '  %s9%s  配置上游          %s自动建分组和密钥%s\n'    "$DIM" "$R" "$DIM" "$R"
     echo
-    printf '  %s9%s  重启容器\n'                                  "$DIM" "$R"
-    printf '  %s10%s 升级版本\n'                                   "$DIM" "$R"
-    printf '  %s11%s 备份数据          %s打包 .env + data%s\n'     "$DIM" "$R" "$DIM" "$R"
-    printf '  %s12%s 修改密码          %sOpenChamber / Sub2API%s\n'  "$MAG" "$R" "$DIM" "$R"
-    printf '  %s13%s 开机自启\n'                                   "$DIM" "$R"
-    printf '  %s14%s 卸载\n'                                       "$RED" "$R"
+    printf '  %s10%s 重启容器\n'                                  "$DIM" "$R"
+    printf '  %s11%s 升级版本\n'                                   "$DIM" "$R"
+    printf '  %s12%s 备份数据          %s打包 .env + data%s\n'     "$DIM" "$R" "$DIM" "$R"
+    printf '  %s13%s 修改密码          %sOpenChamber / Sub2API%s\n'  "$MAG" "$R" "$DIM" "$R"
+    printf '  %s14%s 开机自启\n'                                   "$DIM" "$R"
+    printf '  %s15%s 卸载\n'                                       "$RED" "$R"
     echo
     printf '  %s0%s  退出\n'                                       "$DIM" "$R"
     echo
@@ -476,14 +519,15 @@ menu() {
       4) act_port443 ;;
       5) act_domain ;;
       6) act_cert ;;
-      7) act_logs; continue ;;
-      8) act_bootstrap ;;
-      9) act_restart ;;
-      10) act_upgrade ;;
-      11) act_backup ;;
-      12) act_passwd ;;
-      13) act_autostart ;;
-      14) act_uninstall ;;
+      7) act_cert_fix ;;
+      8) act_logs; continue ;;
+      9) act_bootstrap ;;
+      10) act_restart ;;
+      11) act_upgrade ;;
+      12) act_backup ;;
+      13) act_passwd ;;
+      14) act_autostart ;;
+      15) act_uninstall ;;
       0|q|Q) exit 0 ;;
       *) printf '  %s无效编号%s\n' "$RED" "$R" ;;
     esac
@@ -502,6 +546,7 @@ case "${1:-}" in
   443)       act_port443 ;;
   domain)    act_domain ;;
   cert)      act_cert ;;
+  cert-fix)  act_cert_fix ;;
   logs)      act_logs ;;
   bootstrap) act_bootstrap ;;
   restart)   act_restart ;;
@@ -521,6 +566,7 @@ oc —— oc-stack 控制台
   oc 443            443 端口共享（域名不带端口访问）
   oc domain         更换域名
   oc cert           证书状态
+  oc cert-fix       证书续期改零停机
   oc logs           查看日志
   oc bootstrap      配置上游
   oc restart        重启
