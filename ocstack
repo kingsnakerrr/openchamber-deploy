@@ -21,6 +21,8 @@ OCSTACK_VERSION="2.0.0"
 CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
 CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
 CC_API_KEY="${CC_API_KEY:-}"
+PORT_CONFLICT_MODE="free"
+IP_MODE_FORCED="false"
 OC_DOMAIN_ARG=""
 API_DOMAIN_ARG=""
 EMAIL_ARG=""
@@ -121,6 +123,56 @@ PY
   else
     printf '%s=%s\n' "$k" "$v" >> "$ENV_FILE"
   fi
+}
+
+# 创建并启用 swap 文件（内存不足的机器必需）
+create_swap() {
+  local size_mb="${1:-4096}"
+  local f=/swapfile
+
+  if [[ -f "$f" ]] && swapon --show | grep -q "$f"; then
+    ok "swap 已启用（$(free -h | awk '/Swap/{print $2}')）"
+    return 0
+  fi
+
+  info "创建 ${size_mb}MB swap 文件（大项目/多容器必需）"
+
+  # 磁盘空间检查
+  local avail_mb
+  avail_mb=$(df -m / | awk 'NR==2{print $4}')
+  if (( avail_mb < size_mb + 1024 )); then
+    warn "磁盘剩余 ${avail_mb}MB，不足以创建 ${size_mb}MB swap，跳过"
+    return 1
+  fi
+
+  # 清理旧的失败残留
+  [[ -f "$f" ]] && { swapoff "$f" 2>/dev/null || true; rm -f "$f"; }
+
+  if ! fallocate -l "${size_mb}M" "$f" 2>/dev/null; then
+    # 某些文件系统（如 btrfs/openvz）不支持 fallocate，回退 dd
+    dd if=/dev/zero of="$f" bs=1M count="$size_mb" status=none 2>/dev/null || {
+      warn "创建 swap 文件失败，请手动处理"; return 1; }
+  fi
+
+  chmod 600 "$f"
+  mkswap "$f" >/dev/null 2>&1 || { warn "mkswap 失败"; rm -f "$f"; return 1; }
+  if ! swapon "$f" 2>/dev/null; then
+    warn "启用 swap 失败（可能是 OpenVZ/LXC 容器，不支持 swap）"
+    rm -f "$f"
+    return 1
+  fi
+
+  # 持久化，重启后自动挂载
+  if ! grep -qE "^${f}[[:space:]]" /etc/fstab 2>/dev/null; then
+    echo "${f} none swap sw 0 0" >> /etc/fstab
+  fi
+
+  # 降低 swap 倾向，但内存紧张时仍会用
+  sysctl -w vm.swappiness=30 >/dev/null 2>&1 || true
+  grep -q '^vm.swappiness' /etc/sysctl.conf 2>/dev/null || \
+    echo 'vm.swappiness=30' >> /etc/sysctl.conf
+
+  ok "swap 已启用：$(free -h | awk '/Swap/{print $2}')"
 }
 
 # 找一个当前未被占用的 TCP 端口
@@ -339,24 +391,110 @@ cmd_install() {
   need_docker
   ok "Docker $(docker --version | cut -d, -f1) / Compose $(docker compose version --short 2>/dev/null || echo ok)"
 
-  # 80/443 被占用时自动避让
-  local port_in_use=""
+  # ---- 80/443 占用检查 ----
+  # 关键：Let's Encrypt 的 http-01 校验永远访问域名的 80 端口。
+  # 如果 80 被 nginx 占着，Caddy 拿不到证书，HTTPS 必然打不开。
+  # 所以不能只是"换个端口"了事，必须让用户选一条真正可行的路。
+  local port_in_use="" occupier=""
   for p in 80 443; do
-    ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$" && port_in_use="${port_in_use} ${p}"
+    if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$"; then
+      port_in_use="${port_in_use} ${p}"
+    fi
   done
+
   if [[ -n "$port_in_use" ]]; then
-    local free_h free_s
-    free_h="$(free_port 18100)"; free_s="$(free_port $((free_h + 100)))"
-    CADDY_HTTP_PORT="$free_h"; CADDY_HTTPS_PORT="$free_s"
-    warn "80/443 已被占用，Caddy 改用 ${free_h}/${free_s}"
-    warn "如需 HTTPS，请在前置反代里把域名转发到这两个端口"
+    # 提取占用者进程名（不用 sed 正则，直接 awk，避免转义地狱）
+    occupier="$(ss -tlnp 2>/dev/null | grep -E ':(80|443) ' \
+      | grep -o 'users:(("[^"]*"' | sed 's/users:((//; s/"//g' \
+      | sort -u | paste -sd' ' - 2>/dev/null || true)"
+
+    head1 "端口冲突"
+    warn "80/443 已被占用：${port_in_use}"
+    [[ -n "$occupier" ]] && warn "占用者：${occupier}"
+
+    cat <<'EOM'
+
+  HTTPS 证书需要 80 端口做校验（Let's Encrypt 只会访问域名的 80）。
+  80 被别的服务占着，Caddy 就拿不到证书，域名必然打不开。
+
+  三个选择：
+
+    [1] 停掉占用者，让 Caddy 接管 80/443   —— 最干净，HTTPS 直接可用
+    [2] 保留 nginx，我生成反代配置           —— 你手动套用，需要懂 nginx
+    [3] 不上 HTTPS，只用 IP + HTTP           —— 最快能用，但明文不安全
+
+EOM
+
+    local conflict_choice
+    ask conflict_choice "  选择" "1"
+
+    case "$conflict_choice" in
+      2)
+        PORT_CONFLICT_MODE="proxy"
+        CADDY_HTTP_PORT="$(free_port 18100)"
+        CADDY_HTTPS_PORT="$(free_port $((CADDY_HTTP_PORT + 100)))"
+        warn "Caddy 内部监听 ${CADDY_HTTP_PORT}/${CADDY_HTTPS_PORT}，公网由你的 nginx 转发"
+        ;;
+      3)
+        PORT_CONFLICT_MODE="none"
+        IP_MODE_FORCED="true"
+        # IP 模式下 Caddy 不监听 80/443，端口从高位段开始分配
+        CADDY_HTTP_PORT="$(free_port 18100)"
+        CADDY_HTTPS_PORT="$(free_port $((CADDY_HTTP_PORT + 100)))"
+        # 标记：端口计算不能从 CADDY_HTTP_PORT 派生
+        IP_PORTS_BASE="18100"
+        warn "跳过 HTTPS，将用 IP + HTTP 访问"
+        ;;
+      *)
+        PORT_CONFLICT_MODE="takeover"
+        CADDY_HTTP_PORT="80"
+        CADDY_HTTPS_PORT="443"
+        local svc
+        for svc in nginx apache2 httpd caddy; do
+          if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            info "停止并禁用 $svc"
+            systemctl stop "$svc" >/dev/null 2>&1 || true
+            systemctl disable "$svc" >/dev/null 2>&1 || true
+            ok "$svc 已停止"
+          fi
+        done
+        # 停完再验一次
+        sleep 1
+        for p in 80 443; do
+          if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$"; then
+            die "端口 $p 仍被占用，请手动处理后重试：ss -tlnp | grep :$p"
+          fi
+        done
+        ok "80/443 已释放，Caddy 可以申请证书了"
+        ;;
+    esac
   else
+    PORT_CONFLICT_MODE="free"
     ok "80/443 可用"
   fi
 
-  local mem_mb
+  # ---- 内存检查 ----
+  local mem_mb swap_mb
   mem_mb=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
-  (( mem_mb < 3500 )) && warn "内存 ${mem_mb}MB，建议 4GB 以上" || ok "内存 ${mem_mb}MB"
+  swap_mb=$(awk '/SwapTotal/{printf "%d", $2/1024}' /proc/meminfo)
+
+  if (( mem_mb < 3000 )); then
+    warn "内存仅 ${mem_mb}MB，swap ${swap_mb}MB"
+    warn "本套栈需要约 2.5GB（PostgreSQL + Redis + Sub2API + Node + Caddy）"
+    warn "内存不足会 OOM，表现是容器反复重启、网页打不开"
+
+    if (( swap_mb < 2000 )); then
+      if [[ $EUID -eq 0 ]] && [[ "$ASSUME_YES" != "true" ]]; then
+        if ask_yn "  自动创建 4GB swap 文件？" "y"; then
+          create_swap 4096
+        fi
+      elif [[ $EUID -eq 0 ]]; then
+        create_swap 4096
+      fi
+    fi
+  else
+    ok "内存 ${mem_mb}MB"
+  fi
 
   # ---- 2. 网关：本地部署 or 外接 ----
   head1 "2/6 网关"
@@ -450,6 +588,11 @@ EOF
 
   local IP_MODE="false"
   [[ -z "$OC_DOMAIN" ]] && IP_MODE="true"
+  # 端口冲突且选了"不上 HTTPS"，即使填了域名也降级为 IP 模式
+  if [[ "$IP_MODE_FORCED" == "true" ]]; then
+    IP_MODE="true"
+    warn "端口冲突模式下强制使用 IP + HTTP"
+  fi
 
   if [[ -n "$OC_DOMAIN" ]]; then
     head1 "  DNS 检查"
@@ -481,7 +624,8 @@ EOF
   ok "数据库与 JWT 密钥已生成"
 
   if [[ "$IP_MODE" == "true" ]]; then
-    IP_HTTP_PORT="$(free_port $((CADDY_HTTP_PORT + 2)))"
+    # IP 模式：从 18080 起找空闲，绝不从 CADDY 端口派生（会得到 82、84 这种低位端口）
+    IP_HTTP_PORT="$(free_port 18080)"
     IP_API_PORT="$(free_port $((IP_HTTP_PORT + 1)))"
   else
     IP_HTTP_PORT="$(free_port 18080)"
@@ -635,13 +779,114 @@ EOF
     done
   fi
 
+  # ---- 验证 HTTPS 是否真的可用 ----
+  # 这是最关键的一步：容器起来了不等于网站能打开。
+  # 证书申请失败时 Caddy 会一直重试，但进程是健康的，
+  # 不主动探测就会"安装成功"却打不开网页。
+  local TLS_OK="false"
+  if [[ "$IP_MODE" != "true" && -n "$OC_DOMAIN" ]]; then
+    head1 "验证 HTTPS"
+    if wait_certificate "$OC_DOMAIN"; then
+      TLS_OK="true"
+      ok "https://$OC_DOMAIN 可以正常访问"
+    else
+      TLS_OK="false"
+      warn "证书申请失败，https://$OC_DOMAIN 打不开"
+    fi
+  fi
+
   # ---- 开机自启（默认开启，用户可关闭）----
   if [[ $EUID -eq 0 ]]; then
     head1 "设置开机自启"
     cmd_autostart enable 2>/dev/null || warn "开机自启设置失败，可稍后手动：sudo ./ocstack autostart enable"
   fi
 
-  print_summary
+  # TLS 失败时给出可执行的修复建议，而不是假装成功
+  if [[ "$TLS_OK" == "false" && "$IP_MODE" != "true" ]]; then
+    print_tls_failure_help "$OC_DOMAIN"
+  fi
+
+  print_summary "$TLS_OK"
+}
+
+# ---------------------------------------------------------------------------
+# 等待证书签发：轮询真实 HTTPS 请求
+# ---------------------------------------------------------------------------
+wait_certificate() {
+  local domain="$1"
+  local timeout="${2:-180}" elapsed=0
+
+  info "等待证书签发（最多 ${timeout} 秒，Let's Encrypt 通常 10-30 秒）"
+
+  while (( elapsed < timeout )); do
+    # 直接用域名访问，验证端到端（DNS → Caddy → 证书 → 后端）
+    if curl -fsS -m 5 -o /dev/null "https://${domain}/" 2>/dev/null; then
+      return 0
+    fi
+    # 注意：curl -w 失败时已经输出 000，不能再 || echo 000（会拼成 000000）
+    local code
+    code="$(curl -sS -m 5 -k -o /dev/null -w '%{http_code}' "https://${domain}/" 2>/dev/null)"
+    code="${code:-000}"
+    # 任何非 000 的状态码都说明 TCP+TLS 通了（200/302/401/502 都算）
+    if [[ "$code" =~ ^[1-9][0-9][0-9]$ ]]; then
+      return 0
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+    printf '%s. 已等待 %ds%s
+' "$DIM" "$elapsed" "$R"
+  done
+  echo
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# 证书失败诊断
+# ---------------------------------------------------------------------------
+print_tls_failure_help() {
+  local domain="$1"
+  local diag=""
+
+  # 1. 是不是 80 端口没通到 Caddy
+  if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE '[:.]80$'; then
+    diag="80 端口没有服务在监听"
+  elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^oc-caddy$'; then
+    if ! docker port oc-caddy 2>/dev/null | grep -q ':80'; then
+      diag="Caddy 没有绑定 80 端口（被占用时脚本会改端口，但证书校验必须用 80）"
+    fi
+  fi
+
+  printf '
+%s%s证书申请失败%s
+
+' "$B" "$RED" "$R"
+  [[ -n "$diag" ]] && printf '  %s原因：%s
+
+' "$YEL" "$diag"
+
+  cat <<EOF
+  最常见的三个原因：
+
+  ${B}1. 80 端口被别的服务占用${R}
+     证书校验必须走域名的 80 端口，Caddy 占不到就拿不到证书。
+     检查：${DIM}ss -tlnp | grep :80${R}
+     如果是 nginx：${DIM}systemctl stop nginx && systemctl disable nginx${R}
+     然后重跑：${DIM}./ocstack install${R}
+
+  ${B}2. 域名没有解析到这台机器${R}
+     检查：${DIM}dig +short ${domain}${R}
+     应该返回本机公网 IP。不一致就去 DNS 改 A 记录。
+
+  ${B}3. 云厂商安全组没放行 80${R}
+     80 必须能从公网访问，否则 Let's Encrypt 校验不到。
+
+  ${B}查看详细错误：${R}
+     ${DIM}./ocstack logs caddy | grep -iE "error|challenge|obtain" | tail -20${R}
+
+  ${B}临时先能用：${R}
+     重跑 ${DIM}./ocstack install${R}，域名留空走 IP + HTTP 模式。
+
+EOF
 }
 
 # =============================================================================
@@ -1244,6 +1489,7 @@ cmd_uninstall() {
 }
 
 print_summary() {
+  local tls_ok="${1:-false}"
   local oc api pw adm adm_pw gwmode gwurl
   oc="$(envget OC_DOMAIN)"; api="$(envget API_DOMAIN)"
   pw="$(envget OPENCHAMBER_UI_PASSWORD)"
@@ -1265,8 +1511,13 @@ print_summary() {
   printf '%s%s╰──────────────────────────────────────────────────────────╯%s\n' "$B" "$GRN" "$R"
 
   printf '\n%s【OpenChamber】%s  —— 平时用这个\n' "$B" "$R"
-  if [[ -n "$oc" ]]; then
+  if [[ -n "$oc" && "$tls_ok" == "true" ]]; then
     printf '   地址    %shttps://%s%s\n' "$GRN" "$oc" "$R"
+  elif [[ -n "$oc" && "$tls_ok" != "true" ]]; then
+    # 证书没成功：给出现在真能打开的地址，别让人对着打不开的域名试
+    printf '   地址    %shttp://%s:%s%s  %s(HTTPS 暂不可用)%s\n' \
+      "$GRN" "$ip" "$http_port" "$R" "$YEL" "$R"
+    printf '   %s域名 %s 已配置但证书未签发，详见上方诊断%s\n' "$DIM" "$oc" "$R"
   else
     printf '   地址    %shttp://%s:%s%s\n' "$GRN" "$ip" "$http_port" "$R"
     printf '   %s注意：IP 模式是 HTTP 明文，配好域名后重跑 ./ocstack install 即可升 HTTPS%s\n' "$DIM" "$R"
@@ -1278,7 +1529,7 @@ print_summary() {
     printf '   密钥请在原网关后台创建后，填进 OpenChamber 设置 → 提供商\n' "$DIM" "$R"
   else
     printf '\n%s【Sub2API 后台】%s  —— 填上游地址和 Key 的地方\n' "$B" "$R"
-    if [[ -n "$api" ]]; then
+    if [[ -n "$api" && "$tls_ok" == "true" ]]; then
       printf '   地址    %shttps://%s%s\n' "$GRN" "$api" "$R"
     else
       printf '   地址    %shttp://127.0.0.1:%s%s  （需 SSH 隧道）\n' "$GRN" "$sub_port" "$R"
