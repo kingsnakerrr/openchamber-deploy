@@ -106,14 +106,30 @@ ssh -L 18104:127.0.0.1:18104 root@服务器
 ## 命令
 
 ```bash
-./ocstack status        状态、地址、证书
-./ocstack verify        自检
-./ocstack upgrade       升级
-./ocstack uninstall     卸载（数据保留）
-./ocstack uninstall --purge   连数据删
-./ocstack bootstrap     补配置网关
-./ocstack logs caddy    证书日志
+./ocstack status             状态、地址、证书
+./ocstack verify             自检（失败返回非零退出码）
+./ocstack autostart enable   开机自启
+./ocstack autostart status   查看自启状态
+./ocstack upgrade            升级
+./ocstack uninstall          卸载（数据保留）
+./ocstack uninstall --purge  连数据删
+./ocstack bootstrap          补配置网关
+./ocstack logs caddy         证书日志
 ```
+
+## 开机自启
+
+`./ocstack install` 会自动启用。VPS 重启后容器会自己起来，不用手动干预。
+
+```bash
+./ocstack autostart status    # 看是否启用
+./ocstack autostart enable    # 手动开启
+./ocstack autostart disable   # 关闭
+```
+
+实现方式：一个 systemd oneshot 单元 `oc-stack.service`，依赖 `docker.service`，开机后先等 Docker 真正可用（最多 120 秒），再执行 `docker compose up -d`。这比容器的 `restart: unless-stopped` 更可靠——后者在 Docker 起得比网络晚、或容器停在异常状态时不管用。
+
+`uninstall` 会连带移除这个单元，避免重启后 systemd 去找已经不存在的目录。
 
 ## 常见情况
 
@@ -154,6 +170,8 @@ bash <(curl -Ls .../install.sh) --cc-key sk-你的订阅key
 | Sub2API 本身没有 Telegram | 截图那种面板是第三方项目，需单独部署 |
 | 上游 401 会禁用账号 | 修好 Key 后要在后台手动恢复状态 |
 | `max_tokens` 上限 200000 | 配置里用 `max_completion_tokens` 规避 |
+| 重装会保留所有密钥 | 想重新生成就删掉 `.env` 里对应的行 |
+| 端口也持久化 | 重装不会换端口，反代和隧道不会失效 |
 
 ## 安全
 
