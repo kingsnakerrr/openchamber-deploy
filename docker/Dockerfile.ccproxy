@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Command Code 订阅代理镜像
+#
+# 把 npm 包在构建阶段装好，而不是每次容器启动时现装。
+# 好处：启动快、不依赖运行时访问 npm、版本可锁定可复现。
+# =============================================================================
+FROM node:24-alpine
+
+ARG CC_PROXY_VERSION=0.4.1
+
+RUN npm install -g --no-audit --no-fund \
+      "commandcode-api-proxy@${CC_PROXY_VERSION}" \
+    && npm cache clean --force
+
+# 非 root 运行
+RUN addgroup -g 10001 ccproxy \
+    && adduser -D -u 10001 -G ccproxy ccproxy
+
+USER ccproxy
+
+EXPOSE 8787
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -q -T 3 -O /dev/null http://127.0.0.1:8787/health || exit 1
+
+CMD ["commandcode-api-proxy"]

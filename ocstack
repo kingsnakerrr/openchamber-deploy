@@ -11,6 +11,7 @@
 #   ./ocstack upgrade      拉新镜像并重建
 #   ./ocstack bootstrap    自动配置 Sub2API（分组/账号/密钥）
 #   ./ocstack verify       六层验证
+#   ./ocstack autostart    开机自启（enable/disable/status）
 #   ./ocstack uninstall    卸载
 #   ./ocstack cert         查看证书与续期状态
 # =============================================================================
@@ -68,13 +69,21 @@ prepare_dirs() {
   mkdir -p "$ROOT"/data/{openchamber,opencode/share,opencode/state,opencode/config} \
            "$ROOT"/data/{sub2api,postgres,redis} \
            "$ROOT"/workspaces "$ROOT"/caddy 2>/dev/null || true
+
+  # 只修目录本身的属主，绝不递归。
+  # 递归 chown 会在每次 up/restart 时遍历整个 workspaces，
+  # 项目一大就卡住，还会把你通过 SSH 建的文件改掉属主。
   for d in "$ROOT"/data/openchamber \
            "$ROOT"/data/opencode/share \
            "$ROOT"/data/opencode/state \
            "$ROOT"/data/opencode/config \
            "$ROOT"/workspaces; do
-    chown -R 1000:1000 "$d" 2>/dev/null || \
-      warn "无法 chown $d（非 root 运行？容器内会尝试自行修正）"
+    [[ -d "$d" ]] || continue
+    local owner
+    owner="$(stat -c '%u:%g' "$d" 2>/dev/null || echo '')"
+    if [[ "$owner" != "1000:1000" ]]; then
+      chown 1000:1000 "$d" 2>/dev/null || true
+    fi
   done
 }
 
@@ -172,6 +181,8 @@ ask_yn() {
 # =============================================================================
 write_caddyfile() {
   local oc_dom="$1" api_dom="$2" email="$3" ip_mode="$4" http_port="${5:-18080}" api_port="${6:-18081}"
+  # 外接网关时本地没有 sub2api 容器，不能生成指向它的反代
+  local gw_mode="${7:-local}"
 
   mkdir -p "$CADDY_DIR"
   [[ -f "$CADDY_FILE" ]] && cp "$CADDY_FILE" "$CADDY_FILE.bak.$(date +%s)"
@@ -213,6 +224,10 @@ EOF
 	}
 }
 
+EOF
+      # 只有本地部署网关时才生成 Sub2API 入口
+      if [[ "$gw_mode" == "local" ]]; then
+        cat <<EOF
 # Sub2API 单独一个端口，方便客户端填 baseURL
 :${api_port} {
 	encode gzip
@@ -229,6 +244,7 @@ EOF
 	}
 }
 EOF
+      fi
     else
       # 域名模式：自动 HTTPS + 自动续期（Caddy 内置 ACME）
       if [[ -n "$oc_dom" ]]; then
@@ -477,11 +493,62 @@ EOF
 
   # ---- 4. 写配置 ----
   head1 "5/6 写入配置"
-  [[ -f "$ENV_FILE" ]] && { cp "$ENV_FILE" "$ENV_FILE.bak.$(date +%s)"; warn "已有 .env，已备份"; }
+
+  # 重装时绝不能覆盖已有密钥：数据库密码、JWT、API Key 一旦变了，
+  # 旧数据就连不上、所有人被登出、网关 Key 作废。
+  # 原则：新值只在缺失时生成，已存在的值原样保留。
+  local REINSTALL="false"
+  [[ -f "$ENV_FILE" ]] && {
+    REINSTALL="true"
+    cp "$ENV_FILE" "$ENV_FILE.bak.$(date +%s)"
+    warn "已有 .env，已备份；将保留现有密钥，只补缺失项"
+  }
+
+  # keep <键> <新值>：文件里已有值就用旧的，否则用新值
+  keep() {
+    local k="$1" fresh="$2" cur
+    cur="$(envget "$k")"
+    if [[ -n "$cur" ]]; then printf '%s' "$cur"; else printf '%s' "$fresh"; fi
+  }
+
+  local V_POSTGRES_PASSWORD V_REDIS_PASSWORD V_JWT_SECRET V_TOTP_KEY
+  local V_OPENCHAMBER_UI_PASSWORD V_ADMIN_EMAIL V_ADMIN_PASSWORD
+  local V_SUB2API_API_KEY V_CC_API_KEY V_SUB2API_MODEL V_SUB2API_MODEL_ALIAS
+  local V_SUB2API_MODEL_NAME V_OPENCODE_VERSION V_OPENCHAMBER_VERSION
+  local V_HTTP_PORT V_API_HTTP_PORT V_SUB2API_LOCAL_PORT V_TZ
+
+  V_POSTGRES_PASSWORD="$(keep POSTGRES_PASSWORD "$(rand_hex)")"
+  V_REDIS_PASSWORD="$(keep REDIS_PASSWORD "$(rand_hex)")"
+  V_JWT_SECRET="$(keep JWT_SECRET "$(rand_hex)")"
+  V_TOTP_KEY="$(keep TOTP_ENCRYPTION_KEY "$(rand_hex)")"
+  V_OPENCHAMBER_UI_PASSWORD="$(keep OPENCHAMBER_UI_PASSWORD "$OPENCHAMBER_UI_PASSWORD")"
+  V_ADMIN_EMAIL="$(keep ADMIN_EMAIL "$ADMIN_EMAIL")"
+  V_ADMIN_PASSWORD="$(keep ADMIN_PASSWORD "$ADMIN_PASSWORD")"
+  V_SUB2API_API_KEY="$(keep SUB2API_API_KEY "")"
+  V_CC_API_KEY="$(keep CC_API_KEY "$CC_API_KEY")"
+  V_SUB2API_MODEL="$(keep SUB2API_MODEL "deepseek/deepseek-v4.1-flash")"
+  V_SUB2API_MODEL_ALIAS="$(keep SUB2API_MODEL_ALIAS "deepseek-v4.1-flash")"
+  V_SUB2API_MODEL_NAME="$(keep SUB2API_MODEL_NAME "DeepSeek V4.1 Flash")"
+  V_OPENCODE_VERSION="$(keep OPENCODE_VERSION "${OPENCODE_VERSION:-2.2.6}")"
+  V_OPENCHAMBER_VERSION="$(keep OPENCHAMBER_VERSION "${OPENCHAMBER_VERSION:-2.7.0}")"
+  V_TZ="$(keep TZ "Asia/Shanghai")"
+
+  # 端口也必须持久化：重装换了端口，已有的反代规则和 SSH 隧道就全失效了
+  V_HTTP_PORT="$(keep HTTP_PORT "$IP_HTTP_PORT")"
+  V_API_HTTP_PORT="$(keep API_HTTP_PORT "$IP_API_PORT")"
+  V_SUB2API_LOCAL_PORT="$(keep SUB2API_LOCAL_PORT "$SUB2API_LOCAL_PORT")"
+  # Caddy 端口同理
+  CADDY_HTTP_PORT="$(keep CADDY_HTTP_PORT "${CADDY_HTTP_PORT:-80}")"
+  CADDY_HTTPS_PORT="$(keep CADDY_HTTPS_PORT "${CADDY_HTTPS_PORT:-443}")"
+
+  if [[ "$REINSTALL" == "true" ]]; then
+    ok "沿用原有密码 / 密钥 / 端口"
+  fi
 
   {
     echo "# oc-stack 配置 — $(date -Iseconds)"
     echo "# 由 ./ocstack install 生成。改完执行 ./ocstack restart"
+    echo "# 已存在的值重装时不会被覆盖，删掉某行才会重新生成"
     echo
     echo "# ---- 网关模式：local（本地部署）/ external（外接已有）----"
     echo "GATEWAY_MODE=${GATEWAY_MODE}"
@@ -494,52 +561,54 @@ EOF
     echo "IP_MODE=${IP_MODE}"
     echo
     echo "# ---- 版本（升级时改这里）----"
-    echo "OPENCODE_VERSION=${OPENCODE_VERSION:-2.2.6}"
-    echo "OPENCHAMBER_VERSION=${OPENCHAMBER_VERSION:-2.7.0}"
+    echo "OPENCODE_VERSION=${V_OPENCODE_VERSION}"
+    echo "OPENCHAMBER_VERSION=${V_OPENCHAMBER_VERSION}"
+    echo "SUB2API_VERSION=$(keep SUB2API_VERSION "0.2.20")"
+    echo "CADDY_VERSION=$(keep CADDY_VERSION "2.11")"
     echo
     echo "# ---- 登录凭据 ----"
-    echo "OPENCHAMBER_UI_PASSWORD=${OPENCHAMBER_UI_PASSWORD}"
-    echo "ADMIN_EMAIL=${ADMIN_EMAIL}"
-    echo "ADMIN_PASSWORD=${ADMIN_PASSWORD}"
+    echo "OPENCHAMBER_UI_PASSWORD=${V_OPENCHAMBER_UI_PASSWORD}"
+    echo "ADMIN_EMAIL=${V_ADMIN_EMAIL}"
+    echo "ADMIN_PASSWORD=${V_ADMIN_PASSWORD}"
     echo
-    echo "# ---- 数据库 ----"
+    echo "# ---- 数据库（改了必须同步改数据库内部密码）----"
     echo "POSTGRES_USER=sub2api"
     echo "POSTGRES_DB=sub2api"
-    echo "POSTGRES_PASSWORD=$(rand_hex)"
-    echo "REDIS_PASSWORD=$(rand_hex)"
+    echo "POSTGRES_PASSWORD=${V_POSTGRES_PASSWORD}"
+    echo "REDIS_PASSWORD=${V_REDIS_PASSWORD}"
     echo
     echo "# ---- 固定密钥（不要删，删了所有人被登出、2FA 失效）----"
-    echo "JWT_SECRET=$(rand_hex)"
-    echo "TOTP_ENCRYPTION_KEY=$(rand_hex)"
+    echo "JWT_SECRET=${V_JWT_SECRET}"
+    echo "TOTP_ENCRYPTION_KEY=${V_TOTP_KEY}"
     echo
     echo "# ---- 模型（装完在网页里可以改）----"
-    echo "SUB2API_MODEL=deepseek/deepseek-v4.1-flash"
-    echo "SUB2API_MODEL_ALIAS=deepseek-v4.1-flash"
-    echo "SUB2API_MODEL_NAME=DeepSeek V4.1 Flash"
-    echo "SUB2API_API_KEY="
+    echo "SUB2API_MODEL=${V_SUB2API_MODEL}"
+    echo "SUB2API_MODEL_ALIAS=${V_SUB2API_MODEL_ALIAS}"
+    echo "SUB2API_MODEL_NAME=${V_SUB2API_MODEL_NAME}"
+    echo "SUB2API_API_KEY=${V_SUB2API_API_KEY}"
     echo
     echo "# ---- 端口 ----"
-    echo "CADDY_HTTP_PORT=${CADDY_HTTP_PORT:-80}"
-    echo "CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT:-443}"
-    echo "HTTP_PORT=${IP_HTTP_PORT}"
-    echo "API_HTTP_PORT=${IP_API_PORT}"
-    echo "SUB2API_LOCAL_PORT=${SUB2API_LOCAL_PORT}"
+    echo "CADDY_HTTP_PORT=${CADDY_HTTP_PORT}"
+    echo "CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT}"
+    echo "HTTP_PORT=${V_HTTP_PORT}"
+    echo "API_HTTP_PORT=${V_API_HTTP_PORT}"
+    echo "SUB2API_LOCAL_PORT=${V_SUB2API_LOCAL_PORT}"
     echo
     echo "# ---- Command Code 订阅代理（可选，填了才会启 cc 容器）----"
-    echo "CC_API_KEY=${CC_API_KEY}"
+    echo "CC_API_KEY=${V_CC_API_KEY}"
     echo "CC_PROXY_VERSION=0.4.1"
     echo "CC_IDLE_TIMEOUT_MS=300000"
     echo "CC_UPSTREAM_TIMEOUT_MS=600000"
     echo
     echo "# ---- 其他 ----"
-    echo "TZ=Asia/Shanghai"
+    echo "TZ=${V_TZ}"
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
   ok ".env 已写入（600）"
 
   # ---- 5. 构建启动 ----
   head1 "6/6 构建并启动"
-  write_caddyfile "$OC_DOMAIN" "$API_DOMAIN" "$ACME_EMAIL" "$IP_MODE" "$IP_HTTP_PORT" "$IP_API_PORT"
+  write_caddyfile "$OC_DOMAIN" "$API_DOMAIN" "$ACME_EMAIL" "$IP_MODE" "$IP_HTTP_PORT" "$IP_API_PORT" "$GATEWAY_MODE"
 
   info "构建 OpenChamber 镜像（首次 3-5 分钟）"
   dc build openchamber 2>&1 | tail -2
@@ -551,10 +620,26 @@ EOF
 
   info "等待就绪"
   local i
-  for i in $(seq 1 80); do
-    docker exec oc-sub2api wget -q -T 3 -O /dev/null http://localhost:8080/health 2>/dev/null && { ok "Sub2API 就绪"; break; }
-    sleep 3
-  done
+  if [[ "$GATEWAY_MODE" == "external" ]]; then
+    # 外接模式没有本地 sub2api 容器，等 OpenChamber 自己就绪即可
+    for i in $(seq 1 60); do
+      if docker exec oc-openchamber sh -c 'curl -fsS -m 2 http://127.0.0.1:3000/health >/dev/null 2>&1' 2>/dev/null; then
+        ok "OpenChamber 就绪"; break
+      fi
+      sleep 2
+    done
+  else
+    for i in $(seq 1 80); do
+      docker exec oc-sub2api wget -q -T 3 -O /dev/null http://localhost:8080/health 2>/dev/null && { ok "Sub2API 就绪"; break; }
+      sleep 3
+    done
+  fi
+
+  # ---- 开机自启（默认开启，用户可关闭）----
+  if [[ $EUID -eq 0 ]]; then
+    head1 "设置开机自启"
+    cmd_autostart enable 2>/dev/null || warn "开机自启设置失败，可稍后手动：sudo ./ocstack autostart enable"
+  fi
 
   print_summary
 }
@@ -936,6 +1021,106 @@ cmd_verify() {
 # =============================================================================
 cmd_up()       { need_env; dc up -d "$@"; }
 cmd_down()     { need_env; dc down; }
+# =============================================================================
+# 开机自启（systemd）
+#
+# docker-compose 的 restart: unless-stopped 只在 Docker 守护进程活着时生效，
+# 而且它不会检查容器是否真的健康。VPS 重启后如果 Docker 起得比网络晚，
+# 容器可能停在异常状态。这里用一个 oneshot 单元在开机后兜底拉起。
+# =============================================================================
+AUTOSTART_UNIT="/etc/systemd/system/oc-stack.service"
+
+autostart_profiles() {
+  # 根据 .env 决定 compose 需要哪些 profile
+  local prof=""
+  [[ "$(envget GATEWAY_MODE)" != "external" ]] && prof="$prof --profile local-gw"
+  [[ -n "$(envget CC_API_KEY)" ]] && prof="$prof --profile cc"
+  printf '%s' "$prof"
+}
+
+cmd_autostart() {
+  need_env
+  local action="${1:-status}"
+
+  case "$action" in
+    enable)
+      [[ $EUID -eq 0 ]] || die "需要 root：sudo ./ocstack autostart enable"
+
+      if ! systemctl is-enabled docker >/dev/null 2>&1; then
+        info "启用 Docker 开机自启"
+        systemctl enable docker >/dev/null 2>&1 || warn "Docker 自启设置失败"
+      fi
+
+      local prof
+      prof="$(autostart_profiles)"
+
+      cat > "$AUTOSTART_UNIT" <<UNIT
+[Unit]
+Description=oc-stack (Sub2API + OpenCode + OpenChamber)
+Documentation=https://github.com/kingsnakerrr/openchamber-deploy
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${ROOT}
+# 等 Docker 守护进程真正可用（最多 120 秒）
+ExecStartPre=/bin/sh -c 'i=0; while [ \$i -lt 60 ]; do docker info >/dev/null 2>&1 && exit 0; sleep 2; i=\$((i+1)); done; exit 1'
+ExecStart=/usr/bin/docker compose --env-file ${ENV_FILE} -f ${COMPOSE_FILE}${prof} up -d
+ExecStop=/usr/bin/docker compose --env-file ${ENV_FILE} -f ${COMPOSE_FILE}${prof} down
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+      systemctl daemon-reload
+      systemctl enable oc-stack.service >/dev/null 2>&1
+      ok "已设置开机自启（oc-stack.service）"
+      echo
+      printf '  验证：%ssudo systemctl is-enabled oc-stack%s\n' "$DIM" "$R"
+      printf '  测试：%ssudo systemctl restart oc-stack && ./ocstack status%s\n' "$DIM" "$R"
+      ;;
+
+    disable)
+      [[ $EUID -eq 0 ]] || die "需要 root"
+      systemctl disable oc-stack.service >/dev/null 2>&1 || true
+      rm -f "$AUTOSTART_UNIT"
+      systemctl daemon-reload
+      ok "已取消开机自启（容器仍在运行）"
+      ;;
+
+    status)
+      local en docker_en
+      en="$(systemctl is-enabled oc-stack.service 2>/dev/null || echo 'not-found')"
+      docker_en="$(systemctl is-enabled docker 2>/dev/null || echo 'unknown')"
+
+      head1 "开机自启"
+      if [[ "$en" == "enabled" ]]; then
+        printf '  oc-stack   %s● 已启用%s\n' "$GRN" "$R"
+      else
+        printf '  oc-stack   %s● 未启用%s\n' "$YEL" "$R"
+      fi
+      if [[ "$docker_en" == "enabled" ]]; then
+        printf '  docker     %s● 已启用%s\n' "$GRN" "$R"
+      else
+        printf '  docker     %s● %s（容器不会自动恢复）%s\n' "$RED" "$docker_en" "$R"
+      fi
+
+      if [[ "$en" != "enabled" ]]; then
+        echo
+        printf '  %s开启：sudo ./ocstack autostart enable%s\n' "$DIM" "$R"
+      fi
+      ;;
+
+    *)
+      die "用法：./ocstack autostart [enable|disable|status]"
+      ;;
+  esac
+}
+
 cmd_restart()  { need_env; dc restart; }
 cmd_logs()     { need_env; dc logs -f --tail=100 "$@"; }
 
@@ -1029,10 +1214,19 @@ cmd_uninstall() {
 
   if [[ "$FORCE" != "true" ]] && ! ask_yn "  确认卸载？" "n"; then info "已取消"; return; fi
 
+  # 先摘掉开机自启，否则重启时 systemd 会去找已经不存在的目录
+  if [[ -f "$AUTOSTART_UNIT" ]]; then
+    info "移除开机自启"
+    systemctl disable oc-stack.service >/dev/null 2>&1 || true
+    rm -f "$AUTOSTART_UNIT"
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+
   info "停止容器"
   dc down --remove-orphans 2>/dev/null || true
   info "删除镜像"
   docker rmi "oc-stack/openchamber:$(envget OPENCHAMBER_VERSION)" 2>/dev/null || true
+  docker rmi "oc-stack/ccproxy:$(envget CC_PROXY_VERSION 2>/dev/null || echo 0.4.1)" 2>/dev/null || true
 
   if [[ "$PURGE" == "true" ]]; then
     warn "删除全部数据（不可恢复）"
@@ -1145,10 +1339,11 @@ main() {
   case "$cmd" in
     install)    cmd_install "$@" ;;
     bootstrap)  cmd_bootstrap "$@" ;;
-    verify)     cmd_verify || true ;;
+    verify)     cmd_verify ;;
     up)         cmd_up "$@" ;;
     down)       cmd_down ;;
     restart)    cmd_restart ;;
+    autostart)  cmd_autostart "$@" ;;
     status)     cmd_status ;;
     logs)       cmd_logs "$@" ;;
     cert)       cmd_cert ;;

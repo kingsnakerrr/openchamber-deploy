@@ -92,6 +92,17 @@ need_pkg jq jq
 need_pkg openssl openssl
 need_pkg tar tar
 need_pkg gzip gzip
+# ocstack 用 python3 解析 JSON / 生成配置
+need_pkg python3 python3
+# ss 由 iproute2 提供，用于端口探测
+need_pkg ss iproute2
+
+# systemd 是开机自启的前提
+if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+  skip "systemd 可用（开机自启会生效）"
+else
+  warn "未检测到运行中的 systemd（容器/WSL 环境？），开机自启将不可用"
+fi
 
 # ca-certificates 没有命令形态，单独判断
 if dpkg -s ca-certificates >/dev/null 2>&1; then

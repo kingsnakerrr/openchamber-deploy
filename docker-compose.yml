@@ -16,7 +16,7 @@ services:
   # Caddy：自动申请 + 自动续期证书，反代 WebSocket 和 SSE
   # ---------------------------------------------------------------------------
   caddy:
-    image: caddy:2-alpine
+    image: caddy:${CADDY_VERSION:-2.11}
     container_name: oc-caddy
     restart: unless-stopped
     ports:
@@ -91,7 +91,7 @@ services:
   # Sub2API 网关
   # ---------------------------------------------------------------------------
   sub2api:
-    image: weishaw/sub2api:latest
+    image: weishaw/sub2api:${SUB2API_VERSION:-0.2.20}
     container_name: oc-sub2api
     restart: unless-stopped
     # 只有部署本地网关时才启动；外接已有 Sub2API 时跳过
@@ -219,7 +219,12 @@ services:
   # 不需要 404.rw 教程里的 socat 网桥那一套。
   # ---------------------------------------------------------------------------
   cc-proxy:
-    image: node:24-alpine
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ccproxy
+      args:
+        CC_PROXY_VERSION: ${CC_PROXY_VERSION:-0.4.1}
+    image: oc-stack/ccproxy:${CC_PROXY_VERSION:-0.4.1}
     container_name: oc-cc-proxy
     restart: unless-stopped
     profiles: ["cc"]
@@ -232,20 +237,10 @@ services:
       - CC_IDLE_TIMEOUT_MS=${CC_IDLE_TIMEOUT_MS:-300000}
       - CC_UPSTREAM_TIMEOUT_MS=${CC_UPSTREAM_TIMEOUT_MS:-600000}
       - LOG_LEVEL=${CC_LOG_LEVEL:-info}
-    command:
-      - sh
-      - -c
-      - |
-        npm install -g --no-audit --no-fund commandcode-api-proxy@${CC_PROXY_VERSION:-0.4.1} >/dev/null 2>&1
-        exec commandcode-api-proxy
     networks:
       - oc-net
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:8787/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
 
 networks:
   oc-net:
